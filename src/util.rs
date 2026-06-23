@@ -42,14 +42,14 @@ pub async fn append_jsonl(path: &Path, value: &impl Serialize) -> anyhow::Result
     Ok(())
 }
 
-pub fn hmac_sha256_hex(secret: &str, bytes: &[u8]) -> String {
-    hex_lower(&hmac_sha256_bytes(secret.as_bytes(), bytes))
+pub fn hmac_sha256_hex(secret: &str, bytes: &[u8]) -> anyhow::Result<String> {
+    Ok(hex_lower(&hmac_sha256_bytes(secret.as_bytes(), bytes)?))
 }
 
-pub fn hmac_sha256_bytes(key: &[u8], bytes: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts secrets of any length");
+pub fn hmac_sha256_bytes(key: &[u8], bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut mac = HmacSha256::new_from_slice(key).context("failed to initialize HMAC-SHA256")?;
     mac.update(bytes);
-    mac.finalize().into_bytes().to_vec()
+    Ok(mac.finalize().into_bytes().to_vec())
 }
 
 pub async fn sha256_file_hex(path: &Path) -> std::io::Result<String> {
@@ -90,7 +90,7 @@ mod tests {
 
     #[test]
     fn signs_bytes_as_lowercase_hmac_sha256_hex() {
-        let signature = hmac_sha256_hex("secret", b"payload");
+        let signature = hmac_sha256_hex("secret", b"payload").unwrap();
 
         assert_eq!(
             signature,

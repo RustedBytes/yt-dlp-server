@@ -359,18 +359,23 @@ impl FileConfig {
             .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
         let has_explicit_path = has_cli_path || has_env_path;
 
-        if !config_path.exists() {
-            if has_explicit_path {
+        let contents = match std_fs::read_to_string(&config_path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && !has_explicit_path => {
+                return Ok(Self::default());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Err(anyhow!(
                     "config file does not exist: {}",
                     config_path.display()
                 ));
             }
-            return Ok(Self::default());
-        }
-
-        let contents = std_fs::read_to_string(&config_path)
-            .with_context(|| format!("failed to read config file {}", config_path.display()))?;
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to read config file {}", config_path.display())
+                });
+            }
+        };
         toml::from_str(&contents)
             .with_context(|| format!("failed to parse TOML config {}", config_path.display()))
     }
@@ -1066,10 +1071,9 @@ cookies_path = "instagram-cookies.txt"
     fn rejects_unknown_enabled_platform() {
         let _guard = ENV_LOCK.lock().unwrap();
         with_envs(&[("DOWNLOAD_ENABLED_PLATFORMS", "youtube,unknown")], || {
-            let err = match Config::load(None) {
-                Ok(_) => panic!("expected unknown platform to fail config loading"),
-                Err(err) => err,
-            };
+            let err = Config::load(None)
+                .err()
+                .expect("unknown platform should fail config loading");
 
             assert!(err.to_string().contains("unsupported platform `unknown`"));
         });
@@ -1088,10 +1092,9 @@ format = "best"
         )
         .unwrap();
 
-        let err = match Config::load(Some(path.clone())) {
-            Ok(_) => panic!("expected unknown platform policy to fail config loading"),
-            Err(err) => err,
-        };
+        let err = Config::load(Some(path.clone()))
+            .err()
+            .expect("unknown platform policy should fail config loading");
 
         assert!(
             err.to_string()
@@ -1107,6 +1110,8 @@ format = "best"
             .collect::<Vec<_>>();
 
         for (key, value) in envs {
+            // SAFETY: tests that mutate process environment hold ENV_LOCK, so no other
+            // test in this module concurrently reads or writes these variables.
             unsafe {
                 env::set_var(key, value);
             }
@@ -1115,6 +1120,8 @@ format = "best"
         test();
 
         for (key, original) in originals {
+            // SAFETY: tests that mutate process environment hold ENV_LOCK, so restoring
+            // variables is serialized with every environment-dependent config test.
             unsafe {
                 match original {
                     Some(value) => env::set_var(key, value),

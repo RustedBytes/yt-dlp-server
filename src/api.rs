@@ -7910,7 +7910,9 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
                 .await
                 .unwrap();
-            let _ = tx.send(request);
+            if tx.send(request).is_err() {
+                debug!("webhook test receiver dropped before request capture");
+            }
         });
 
         (format!("http://{addr}/webhook"), rx)

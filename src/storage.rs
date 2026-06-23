@@ -167,8 +167,8 @@ fn signed_put_request(
         .secret_access_key
         .as_deref()
         .ok_or_else(|| anyhow!("object storage secret key is not configured"))?;
-    let signing_key = signing_key(secret_key, &date, &config.region);
-    let signature = hex_hmac(&signing_key, string_to_sign.as_bytes());
+    let signing_key = signing_key(secret_key, &date, &config.region)?;
+    let signature = hex_hmac(&signing_key, string_to_sign.as_bytes())?;
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
     );
@@ -256,15 +256,15 @@ fn percent_encode_segment(value: &str) -> String {
     encoded
 }
 
-fn signing_key(secret_key: &str, date: &str, region: &str) -> Vec<u8> {
-    let date_key = hmac_sha256_bytes(format!("AWS4{secret_key}").as_bytes(), date.as_bytes());
-    let date_region_key = hmac_sha256_bytes(&date_key, region.as_bytes());
-    let date_region_service_key = hmac_sha256_bytes(&date_region_key, b"s3");
+fn signing_key(secret_key: &str, date: &str, region: &str) -> anyhow::Result<Vec<u8>> {
+    let date_key = hmac_sha256_bytes(format!("AWS4{secret_key}").as_bytes(), date.as_bytes())?;
+    let date_region_key = hmac_sha256_bytes(&date_key, region.as_bytes())?;
+    let date_region_service_key = hmac_sha256_bytes(&date_region_key, b"s3")?;
     hmac_sha256_bytes(&date_region_service_key, b"aws4_request")
 }
 
-fn hex_hmac(key: &[u8], bytes: &[u8]) -> String {
-    hex_lower(&hmac_sha256_bytes(key, bytes))
+fn hex_hmac(key: &[u8], bytes: &[u8]) -> anyhow::Result<String> {
+    Ok(hex_lower(&hmac_sha256_bytes(key, bytes)?))
 }
 
 fn header_value(value: &str) -> anyhow::Result<HeaderValue> {

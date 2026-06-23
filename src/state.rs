@@ -1,13 +1,14 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use async_channel::Sender;
+use log::warn;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -119,18 +120,19 @@ impl WorkerPoolState {
     }
 
     pub fn mark_stopped(&self) {
-        let _ = self
+        if self
             .ready
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |ready| {
                 ready.checked_sub(1)
-            });
+            })
+            .is_err()
+        {
+            warn!("worker pool ready count was already zero while marking worker stopped");
+        }
     }
 
     pub fn mark_active(&self, worker_id: usize, job_id: Uuid, url: String) {
-        let mut active = self
-            .active
-            .lock()
-            .expect("worker activity mutex should not be poisoned");
+        let mut active = lock_or_recover(&self.active, "worker activity");
         active.insert(
             worker_id,
             WorkerActivity {
@@ -143,18 +145,12 @@ impl WorkerPoolState {
     }
 
     pub fn clear_active(&self, worker_id: usize) {
-        let mut active = self
-            .active
-            .lock()
-            .expect("worker activity mutex should not be poisoned");
+        let mut active = lock_or_recover(&self.active, "worker activity");
         active.remove(&worker_id);
     }
 
     pub fn active_snapshot(&self) -> Vec<WorkerActivitySnapshot> {
-        let active = self
-            .active
-            .lock()
-            .expect("worker activity mutex should not be poisoned");
+        let active = lock_or_recover(&self.active, "worker activity");
         let mut snapshot = active
             .iter()
             .map(|(worker_id, activity)| WorkerActivitySnapshot {
@@ -195,10 +191,7 @@ impl RateLimiter {
             return RateLimitDecision::Allowed;
         }
 
-        let mut windows = self
-            .windows
-            .lock()
-            .expect("rate limiter mutex should not be poisoned");
+        let mut windows = lock_or_recover(&self.windows, "rate limiter");
         let now = Instant::now();
         let state = match windows.entry(bucket.to_string()) {
             Entry::Occupied(entry) => entry.into_mut(),
@@ -229,10 +222,7 @@ impl RateLimiter {
 
 impl CancellationRegistry {
     pub fn flag_for(&self, id: Uuid) -> Arc<AtomicBool> {
-        let mut flags = self
-            .flags
-            .lock()
-            .expect("cancellation registry mutex should not be poisoned");
+        let mut flags = lock_or_recover(&self.flags, "cancellation registry");
         flags
             .entry(id)
             .or_insert_with(|| Arc::new(AtomicBool::new(false)))
@@ -244,21 +234,25 @@ impl CancellationRegistry {
     }
 
     pub fn cancel_all(&self) {
-        let flags = self
-            .flags
-            .lock()
-            .expect("cancellation registry mutex should not be poisoned");
+        let flags = lock_or_recover(&self.flags, "cancellation registry");
         for flag in flags.values() {
             flag.store(true, Ordering::Relaxed);
         }
     }
 
     pub fn remove(&self, id: Uuid) {
-        let mut flags = self
-            .flags
-            .lock()
-            .expect("cancellation registry mutex should not be poisoned");
+        let mut flags = lock_or_recover(&self.flags, "cancellation registry");
         flags.remove(&id);
+    }
+}
+
+fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!("recovering poisoned mutex name={name}");
+            poisoned.into_inner()
+        }
     }
 }
 

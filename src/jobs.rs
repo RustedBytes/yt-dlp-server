@@ -161,7 +161,7 @@ impl WebhookClient {
         if let Some(secret) = &self.signing_secret {
             request = request.header(
                 "x-download-signature",
-                format!("sha256={}", hmac_sha256_hex(secret, &body)),
+                format!("sha256={}", hmac_sha256_hex(secret, &body)?),
             );
         }
 
@@ -823,8 +823,12 @@ fn redacted_webhook_url(webhook_url: &str) -> String {
     };
     url.set_query(None);
     url.set_fragment(None);
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
+    if url.set_username("").is_err() {
+        debug!("failed to redact webhook URL username");
+    }
+    if url.set_password(None).is_err() {
+        debug!("failed to redact webhook URL password");
+    }
     url.to_string()
 }
 
