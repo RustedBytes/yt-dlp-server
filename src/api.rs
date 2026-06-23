@@ -1185,8 +1185,8 @@ where
     Fut: Future<Output = Result<T, ApiError>>,
 {
     let ids = validate_batch_job_ids(ids)?;
-    let mut succeeded = Vec::new();
-    let mut failed = Vec::new();
+    let mut succeeded = Vec::with_capacity(ids.len());
+    let mut failed = Vec::with_capacity(ids.len());
 
     for id in ids {
         match run(id).await {
@@ -2058,8 +2058,8 @@ async fn storage_cleanup_response(
         });
     }
 
-    let mut deleted = Vec::new();
-    let mut failed = Vec::new();
+    let mut deleted = Vec::with_capacity(jobs_to_delete.len());
+    let mut failed = Vec::with_capacity(jobs_to_delete.len());
     let mut deleted_bytes = 0_u64;
     for candidate in jobs_to_delete {
         match delete_job_record(state, candidate.id).await {
@@ -2113,7 +2113,7 @@ async fn storage_cleanup_plan(
 
     candidates.sort_by_key(|candidate| candidate.updated_at);
     let mut remaining = current_bytes;
-    let mut selected = Vec::new();
+    let mut selected = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         if remaining <= max_bytes {
             break;
@@ -2403,7 +2403,7 @@ fn validate_download_urls(
     }
 
     let mut seen = HashSet::new();
-    let mut urls = Vec::new();
+    let mut urls = Vec::with_capacity(candidates.len().min(max_urls));
     for value in candidates {
         let url = validate_download_url(value, enabled_platforms)?;
         if seen.insert(url.clone()) {
@@ -2452,7 +2452,7 @@ fn validate_download_request(
     }
 
     let mut seen = HashSet::new();
-    let mut urls = Vec::new();
+    let mut urls = Vec::with_capacity(candidates.len().min(config.max_urls_per_request));
     for (index, value) in candidates {
         match validate_download_url(value, &config.download_enabled_platforms) {
             Ok(url) if seen.insert(url.clone()) => urls.push(url),
@@ -2599,7 +2599,7 @@ fn parse_job_search_query(value: Option<String>) -> Result<Option<String>, ApiEr
             "job search query must not contain control characters".to_string(),
         ));
     }
-    if query.chars().count() > 200 {
+    if query.chars().nth(200).is_some() {
         return Err(ApiError::BadRequest(
             "job search query must be at most 200 characters".to_string(),
         ));
@@ -2680,7 +2680,7 @@ impl JobsExportFormat {
 }
 
 fn export_jobs_jsonl(records: &[JobRecord]) -> Result<String, ApiError> {
-    let mut output = String::new();
+    let mut output = String::with_capacity(records.len().saturating_mul(256));
     for record in records {
         let line = serde_json::to_string(record).map_err(|err| ApiError::Internal(err.into()))?;
         output.push_str(&line);
@@ -2714,7 +2714,7 @@ fn export_jobs_csv(records: &[JobRecord]) -> String {
         "yt_dlp_version",
         "elapsed_ms",
     ];
-    let mut output = String::new();
+    let mut output = String::with_capacity(records.len().saturating_mul(512));
     output.push_str(&csv_row(HEADERS.iter().copied()));
     output.push('\n');
     for record in records {

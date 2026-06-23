@@ -410,7 +410,7 @@ async fn write_webhook_dead_letters(
     dead_letters: &[WebhookDeadLetter],
 ) -> anyhow::Result<()> {
     let temp_path = path.with_extension("jsonl.tmp");
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(dead_letters.len().saturating_mul(512));
     for dead_letter in dead_letters {
         serde_json::to_writer(&mut bytes, dead_letter)?;
         bytes.push(b'\n');
@@ -467,7 +467,7 @@ async fn compact_metadata(config: &Config, jobs: &HashMap<Uuid, JobRecord>) -> a
 
 async fn write_jsonl_records(path: &Path, records: &[JobRecord]) -> anyhow::Result<()> {
     let temp_path = path.with_extension("jsonl.tmp");
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(records.len().saturating_mul(512));
     for record in records {
         serde_json::to_writer(&mut bytes, record)?;
         bytes.push(b'\n');

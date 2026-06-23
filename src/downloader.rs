@@ -72,7 +72,7 @@ pub async fn download_url(
     let policy = config.effective_download_policy(url, cookie_profile);
     let attempts = policy.download_max_attempts.max(1);
     let mut last_error = None;
-    let mut attempt_errors = Vec::new();
+    let mut attempt_errors = Vec::with_capacity(attempts);
     for attempt in 1..=attempts {
         if let Err(err) = prepare_download_dir(&job_dir).await {
             return Err(download_error(err, attempt - 1, attempt_errors));

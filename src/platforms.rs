@@ -73,7 +73,7 @@ pub fn default_enabled_platforms() -> Vec<String> {
 }
 
 pub fn validate_enabled_platforms(values: Vec<String>) -> anyhow::Result<Vec<String>> {
-    let mut platforms = Vec::new();
+    let mut platforms = Vec::with_capacity(values.len());
     for value in values {
         let platform = value.trim().to_ascii_lowercase();
         if platform.is_empty() || platforms.contains(&platform) {
@@ -128,11 +128,10 @@ pub fn is_supported_video_url(platform: &str, url: &Url, host: &str) -> bool {
                 || path.starts_with("/share/r/")
         }
         "snapchat" => path_starts_with_segment(path, "spotlight"),
+        "douyin" | "yappy" => path_starts_with_segment(path, "video"),
         "rutube" => path_starts_with_segment(path, "shorts"),
-        "douyin" => path_starts_with_segment(path, "video"),
         "likee" => path_starts_with_segment(path, "v") || path_contains_segment(path, "video"),
         "vk" => path_starts_with_segment(path, "clip") || path_starts_with_segment(path, "video"),
-        "yappy" => path_starts_with_segment(path, "video"),
         _ => false,
     }
 }

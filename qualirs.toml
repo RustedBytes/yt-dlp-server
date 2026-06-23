@@ -1,0 +1,138 @@
+threads = 0
+exclude_paths = [
+    "target",
+    ".git",
+    "node_modules",
+]
+# Suppress detector classes that are not useful for this binary crate:
+# - module-size/coupling/public API/data-carrier reports are expected or inflated by inline tests,
+#   internal DTOs, config structs, and Askama view/template structs;
+# - inline/magic-number/large-future reports duplicate lower-noise compiler or review signals;
+# - concurrency Q0079/Q0080/Q0081/Q0083/Q0085 currently flag scoped locks,
+#   returned JoinHandles, atomics, or test helpers as false positives.
+ignore_findings = [
+    "Q0001",
+    "Q0002",
+    "Q0003",
+    "Q0004",
+    "Q0011",
+    "Q0016",
+    "Q0017",
+    "Q0020",
+    "Q0023",
+    "Q0024",
+    "Q0026",
+    "Q0028",
+    "Q0033",
+    "Q0037",
+    "Q0040",
+    "Q0041",
+    "Q0044",
+    "Q0046",
+    "Q0049",
+    "Q0066",
+    "Q0076",
+    "Q0079",
+    "Q0080",
+    "Q0081",
+    "Q0083",
+    "Q0085",
+]
+min_severity = "info"
+
+[thresholds.arch]
+god_module_loc = 1000
+god_module_items = 20
+public_api_ratio = 0.7
+feature_concentration = 15
+hidden_global_state = 3
+
+[thresholds.design]
+large_trait_methods = 15
+excessive_generics = 5
+deep_trait_bounds = 4
+wide_hierarchy = 10
+fat_impl_methods = 20
+god_struct_fields = 20
+primitive_obsession_fields = 4
+data_clumps_args = 3
+data_clumps_occurrences = 3
+stringly_typed_fields = 3
+large_error_enum_variants = 12
+
+[thresholds.impl]
+long_function_loc = 50
+long_closure_loc = 25
+deep_closure_nesting = 3
+cyclomatic_complexity = 15
+too_many_arguments = 6
+deep_match_nesting = 3
+deep_if_else = 4
+excessive_unwrap = 3
+large_enum_variants = 20
+long_method_chain = 4
+lifetime_explosion = 4
+unsafe_block_overuse = 5
+deeply_nested_type = 3
+interior_mutability_abuse = 5
+
+[thresholds.concurrency]
+large_future_loc = 100
+arc_mutex_overuse = 3
+
+[thresholds.unsafe]
+unsafe_without_comment = true
+
+[policy]
+skip_tests = true
+test_path_markers = [
+    "tests",
+    "test",
+    "tests.rs",
+    "_tests.rs",
+    "fuzz",
+    "fuzz_targets",
+]
+skip_data_carrier_structs = true
+skip_template_structs = true
+data_carrier_struct_suffixes = [
+    "Activity",
+    "Command",
+    "Config",
+    "ConfigFile",
+    "Descriptor",
+    "Details",
+    "Dto",
+    "DTO",
+    "Entry",
+    "Event",
+    "Failure",
+    "Finding",
+    "FormData",
+    "Grant",
+    "Hit",
+    "Inspection",
+    "Item",
+    "Link",
+    "Metrics",
+    "Notification",
+    "Options",
+    "Outcome",
+    "Overview",
+    "Page",
+    "Query",
+    "Report",
+    "Request",
+    "Response",
+    "Result",
+    "Settings",
+    "SettingsFile",
+    "Session",
+    "Snapshot",
+    "Stats",
+    "Summary",
+    "Template",
+    "Variant",
+    "View",
+    "Vulnerability",
+]
