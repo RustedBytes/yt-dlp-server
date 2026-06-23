@@ -756,6 +756,8 @@ mod tests {
             proxy: None,
             max_urls_per_request: 100,
             job_timeout_seconds: 300,
+            download_max_attempts: 1,
+            download_initial_backoff_ms: 0,
             max_download_storage_bytes: 0,
             min_free_disk_bytes: 0,
             webhook_timeout_seconds: 10,

@@ -38,6 +38,8 @@ format = ""
 proxy = ""
 max_urls_per_request = 100
 job_timeout_seconds = 1800
+download_max_attempts = 3
+download_initial_backoff_ms = 1000
 max_download_storage_bytes = 0
 min_free_disk_bytes = 0
 
@@ -71,6 +73,8 @@ Environment variables override TOML values when set:
 - `YT_DLP_PROXY`: optional proxy URL passed as `--proxy`
 - `MAX_URLS_PER_REQUEST`: maximum non-empty URLs accepted in one submission
 - `JOB_TIMEOUT_SECONDS`: per-download timeout; set to `0` to disable timeout enforcement
+- `DOWNLOAD_MAX_ATTEMPTS`: maximum yt-dlp attempts per job, including the first attempt; minimum effective value is `1`
+- `DOWNLOAD_INITIAL_BACKOFF_MS`: initial retry backoff in milliseconds; later retries double this delay; set to `0` for immediate retries
 - `MAX_DOWNLOAD_STORAGE_BYTES`: maximum retained downloaded media bytes; set to `0` to disable automatic cleanup
 - `MIN_FREE_DISK_BYTES`: minimum free bytes required in the download directory before starting a job; set to `0` to disable the preflight check
 - `JOB_RETENTION_LIMIT`: maximum in-memory job records kept queryable through `/v1/jobs/{id}`

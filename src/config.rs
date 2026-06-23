@@ -24,6 +24,8 @@ const DEFAULT_DOWNLOAD_OUTPUT_DIR: &str = "data/downloads";
 const DEFAULT_YT_DLP_COMMAND: &str = "uv";
 const DEFAULT_MAX_URLS_PER_REQUEST: usize = 100;
 const DEFAULT_JOB_TIMEOUT_SECONDS: u64 = 1_800;
+const DEFAULT_DOWNLOAD_MAX_ATTEMPTS: usize = 3;
+const DEFAULT_DOWNLOAD_INITIAL_BACKOFF_MS: u64 = 1_000;
 const DEFAULT_MAX_DOWNLOAD_STORAGE_BYTES: u64 = 0;
 const DEFAULT_MIN_FREE_DISK_BYTES: u64 = 0;
 
@@ -50,6 +52,8 @@ pub struct Config {
     pub proxy: Option<String>,
     pub max_urls_per_request: usize,
     pub job_timeout_seconds: u64,
+    pub download_max_attempts: usize,
+    pub download_initial_backoff_ms: u64,
     pub max_download_storage_bytes: u64,
     pub min_free_disk_bytes: u64,
     pub webhook_timeout_seconds: u64,
@@ -142,6 +146,17 @@ impl Config {
                 "JOB_TIMEOUT_SECONDS",
                 download.job_timeout_seconds,
                 DEFAULT_JOB_TIMEOUT_SECONDS,
+            )?,
+            download_max_attempts: usize_setting(
+                "DOWNLOAD_MAX_ATTEMPTS",
+                download.download_max_attempts,
+                DEFAULT_DOWNLOAD_MAX_ATTEMPTS,
+            )?
+            .max(1),
+            download_initial_backoff_ms: u64_setting(
+                "DOWNLOAD_INITIAL_BACKOFF_MS",
+                download.download_initial_backoff_ms,
+                DEFAULT_DOWNLOAD_INITIAL_BACKOFF_MS,
             )?,
             max_download_storage_bytes: u64_setting(
                 "MAX_DOWNLOAD_STORAGE_BYTES",
@@ -264,6 +279,8 @@ struct DownloadConfig {
     proxy: Option<String>,
     max_urls_per_request: Option<usize>,
     job_timeout_seconds: Option<u64>,
+    download_max_attempts: Option<usize>,
+    download_initial_backoff_ms: Option<u64>,
     max_download_storage_bytes: Option<u64>,
     min_free_disk_bytes: Option<u64>,
 }
@@ -386,6 +403,8 @@ mod tests {
         assert_eq!(config.proxy, None);
         assert_eq!(config.max_urls_per_request, 100);
         assert_eq!(config.job_timeout_seconds, 1_800);
+        assert_eq!(config.download_max_attempts, 3);
+        assert_eq!(config.download_initial_backoff_ms, 1_000);
         assert_eq!(config.max_download_storage_bytes, 0);
         assert_eq!(config.min_free_disk_bytes, 0);
         assert_eq!(
@@ -419,6 +438,8 @@ format = "bv*+ba/b"
 proxy = "socks5://127.0.0.1:1080"
 max_urls_per_request = 12
 job_timeout_seconds = 45
+download_max_attempts = 4
+download_initial_backoff_ms = 250
 max_download_storage_bytes = 1048576
 min_free_disk_bytes = 524288
 "#,
@@ -440,6 +461,8 @@ min_free_disk_bytes = 524288
         assert_eq!(config.proxy.as_deref(), Some("socks5://127.0.0.1:1080"));
         assert_eq!(config.max_urls_per_request, 12);
         assert_eq!(config.job_timeout_seconds, 45);
+        assert_eq!(config.download_max_attempts, 4);
+        assert_eq!(config.download_initial_backoff_ms, 250);
         assert_eq!(config.max_download_storage_bytes, 1048576);
         assert_eq!(config.min_free_disk_bytes, 524288);
 
@@ -449,59 +472,60 @@ min_free_disk_bytes = 524288
     #[test]
     fn env_overrides_download_config() {
         let _guard = ENV_LOCK.lock().unwrap();
-        with_env("DOWNLOAD_WORKERS", "3", || {
-            with_env("DOWNLOAD_OUTPUT_DIR", "env-downloads", || {
-                with_env("YT_DLP_COMMAND", "uvx", || {
-                    with_env("YT_DLP_COOKIES_PATH", "env-cookies.txt", || {
-                        with_env("YT_DLP_FORMAT", "mp4", || {
-                            with_env("YT_DLP_PROXY", "http://127.0.0.1:8080", || {
-                                with_env("MAX_URLS_PER_REQUEST", "7", || {
-                                    with_env("JOB_TIMEOUT_SECONDS", "9", || {
-                                        with_env("MAX_DOWNLOAD_STORAGE_BYTES", "11", || {
-                                            with_env("MIN_FREE_DISK_BYTES", "13", || {
-                                                let config = Config::load(None).unwrap();
+        with_envs(
+            &[
+                ("DOWNLOAD_WORKERS", "3"),
+                ("DOWNLOAD_OUTPUT_DIR", "env-downloads"),
+                ("YT_DLP_COMMAND", "uvx"),
+                ("YT_DLP_COOKIES_PATH", "env-cookies.txt"),
+                ("YT_DLP_FORMAT", "mp4"),
+                ("YT_DLP_PROXY", "http://127.0.0.1:8080"),
+                ("MAX_URLS_PER_REQUEST", "7"),
+                ("JOB_TIMEOUT_SECONDS", "9"),
+                ("DOWNLOAD_MAX_ATTEMPTS", "5"),
+                ("DOWNLOAD_INITIAL_BACKOFF_MS", "17"),
+                ("MAX_DOWNLOAD_STORAGE_BYTES", "11"),
+                ("MIN_FREE_DISK_BYTES", "13"),
+            ],
+            || {
+                let config = Config::load(None).unwrap();
 
-                                                assert_eq!(config.workers, 3);
-                                                assert_eq!(
-                                                    config.downloads_dir,
-                                                    PathBuf::from("env-downloads")
-                                                );
-                                                assert_eq!(config.yt_dlp_command, "uvx");
-                                                assert_eq!(
-                                                    config.cookies_path,
-                                                    Some(PathBuf::from("env-cookies.txt"))
-                                                );
-                                                assert_eq!(config.format.as_deref(), Some("mp4"));
-                                                assert_eq!(
-                                                    config.proxy.as_deref(),
-                                                    Some("http://127.0.0.1:8080")
-                                                );
-                                                assert_eq!(config.max_urls_per_request, 7);
-                                                assert_eq!(config.job_timeout_seconds, 9);
-                                                assert_eq!(config.max_download_storage_bytes, 11);
-                                                assert_eq!(config.min_free_disk_bytes, 13);
-                                            });
-                                        });
-                                    });
-                                });
-                            });
-                        });
-                    });
-                });
-            });
-        });
+                assert_eq!(config.workers, 3);
+                assert_eq!(config.downloads_dir, PathBuf::from("env-downloads"));
+                assert_eq!(config.yt_dlp_command, "uvx");
+                assert_eq!(config.cookies_path, Some(PathBuf::from("env-cookies.txt")));
+                assert_eq!(config.format.as_deref(), Some("mp4"));
+                assert_eq!(config.proxy.as_deref(), Some("http://127.0.0.1:8080"));
+                assert_eq!(config.max_urls_per_request, 7);
+                assert_eq!(config.job_timeout_seconds, 9);
+                assert_eq!(config.download_max_attempts, 5);
+                assert_eq!(config.download_initial_backoff_ms, 17);
+                assert_eq!(config.max_download_storage_bytes, 11);
+                assert_eq!(config.min_free_disk_bytes, 13);
+            },
+        );
     }
 
-    fn with_env(key: &str, value: &str, test: impl FnOnce()) {
-        let original = env::var_os(key);
-        unsafe {
-            env::set_var(key, value);
+    fn with_envs(envs: &[(&str, &str)], test: impl FnOnce()) {
+        let originals = envs
+            .iter()
+            .map(|(key, _)| (*key, env::var_os(key)))
+            .collect::<Vec<_>>();
+
+        for (key, value) in envs {
+            unsafe {
+                env::set_var(key, value);
+            }
         }
+
         test();
-        unsafe {
-            match original {
-                Some(value) => env::set_var(key, value),
-                None => env::remove_var(key),
+
+        for (key, original) in originals {
+            unsafe {
+                match original {
+                    Some(value) => env::set_var(key, value),
+                    None => env::remove_var(key),
+                }
             }
         }
     }

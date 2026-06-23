@@ -32,6 +32,12 @@ max_urls_per_request = 100
 # Set to 0 to disable per-job timeout enforcement.
 job_timeout_seconds = 1800
 
+# Maximum yt-dlp attempts per job, including the first attempt.
+download_max_attempts = 3
+
+# Initial retry backoff in milliseconds. Later retries double this delay.
+download_initial_backoff_ms = 1000
+
 # Set to 0 to disable automatic storage cleanup.
 max_download_storage_bytes = 0
 

@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
 
     config.ensure_dirs().await?;
     debug!(
-        "config loaded addr={} data_dir={} downloads_dir={} metadata_dir={} workers={} queue_size={} body_limit_bytes={} request_timeout_seconds={} api_key_auth_enabled={} rate_limit_requests_per_minute={} yt_dlp_command={} cookies_configured={} format_configured={} proxy_configured={} max_urls_per_request={} job_timeout_seconds={} max_download_storage_bytes={} webhook_timeout_seconds={} webhook_connect_timeout_seconds={} webhook_max_attempts={} webhook_initial_backoff_ms={} webhook_signing_enabled={} allow_private_webhook_urls={} rust_log={}",
+        "config loaded addr={} data_dir={} downloads_dir={} metadata_dir={} workers={} queue_size={} body_limit_bytes={} request_timeout_seconds={} api_key_auth_enabled={} rate_limit_requests_per_minute={} yt_dlp_command={} cookies_configured={} format_configured={} proxy_configured={} max_urls_per_request={} job_timeout_seconds={} download_max_attempts={} download_initial_backoff_ms={} max_download_storage_bytes={} webhook_timeout_seconds={} webhook_connect_timeout_seconds={} webhook_max_attempts={} webhook_initial_backoff_ms={} webhook_signing_enabled={} allow_private_webhook_urls={} rust_log={}",
         config.addr,
         config.data_dir.display(),
         config.downloads_dir.display(),
@@ -55,6 +55,8 @@ async fn main() -> anyhow::Result<()> {
         config.proxy.is_some(),
         config.max_urls_per_request,
         config.job_timeout_seconds,
+        config.download_max_attempts,
+        config.download_initial_backoff_ms,
         config.max_download_storage_bytes,
         config.webhook_timeout_seconds,
         config.webhook_connect_timeout_seconds,
@@ -94,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to bind TCP listener")?;
 
     info!(
-        "server listening addr={} workers={} data_dir={} downloads_dir={} queue_size={} body_limit_bytes={} request_timeout_seconds={} api_key_auth_enabled={} rate_limit_requests_per_minute={} yt_dlp_command={} cookies_configured={} format_configured={} proxy_configured={} max_urls_per_request={} job_timeout_seconds={} max_download_storage_bytes={} webhook_timeout_seconds={} webhook_connect_timeout_seconds={} webhook_max_attempts={} webhook_initial_backoff_ms={} webhook_signing_enabled={} allow_private_webhook_urls={}",
+        "server listening addr={} workers={} data_dir={} downloads_dir={} queue_size={} body_limit_bytes={} request_timeout_seconds={} api_key_auth_enabled={} rate_limit_requests_per_minute={} yt_dlp_command={} cookies_configured={} format_configured={} proxy_configured={} max_urls_per_request={} job_timeout_seconds={} download_max_attempts={} download_initial_backoff_ms={} max_download_storage_bytes={} webhook_timeout_seconds={} webhook_connect_timeout_seconds={} webhook_max_attempts={} webhook_initial_backoff_ms={} webhook_signing_enabled={} allow_private_webhook_urls={}",
         config.addr,
         config.workers,
         config.data_dir.display(),
@@ -110,6 +112,8 @@ async fn main() -> anyhow::Result<()> {
         config.proxy.is_some(),
         config.max_urls_per_request,
         config.job_timeout_seconds,
+        config.download_max_attempts,
+        config.download_initial_backoff_ms,
         config.max_download_storage_bytes,
         config.webhook_timeout_seconds,
         config.webhook_connect_timeout_seconds,

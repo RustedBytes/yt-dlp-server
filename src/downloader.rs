@@ -24,17 +24,7 @@ pub async fn download_url(
 ) -> anyhow::Result<DownloadMetadata> {
     let started = Instant::now();
     let job_dir = config.downloads_dir.join(id.to_string());
-    if job_dir.exists() {
-        fs::remove_dir_all(&job_dir).await.with_context(|| {
-            format!(
-                "failed to clear existing download dir {}",
-                job_dir.display()
-            )
-        })?;
-    }
-    fs::create_dir_all(&job_dir)
-        .await
-        .with_context(|| format!("failed to create download dir {}", job_dir.display()))?;
+    prepare_download_dir(&job_dir).await?;
     if let Err(err) = ensure_min_free_disk_space(config).await {
         cleanup_partial_download(&job_dir).await;
         return Err(err);
@@ -48,16 +38,72 @@ pub async fn download_url(
         "unknown".to_string()
     });
 
-    let outcome = run_yt_dlp(config, id, &job_dir, url).await;
-    match outcome {
-        Ok(()) => {
-            metadata_from_download_dir(&job_dir, url, version, started.elapsed().as_millis()).await
-        }
-        Err(err) => {
-            cleanup_partial_download(&job_dir).await;
-            Err(err)
+    let attempts = config.download_max_attempts.max(1);
+    let mut last_error = None;
+    for attempt in 1..=attempts {
+        prepare_download_dir(&job_dir).await?;
+        let outcome = match run_yt_dlp(config, id, &job_dir, url).await {
+            Ok(()) => {
+                metadata_from_download_dir(
+                    &job_dir,
+                    url,
+                    version.clone(),
+                    started.elapsed().as_millis(),
+                )
+                .await
+            }
+            Err(err) => Err(err),
+        };
+
+        match outcome {
+            Ok(metadata) => return Ok(metadata),
+            Err(err) => {
+                cleanup_partial_download(&job_dir).await;
+                let error = err.to_string();
+                last_error = Some(err);
+                if attempt == attempts {
+                    break;
+                }
+                let delay = retry_backoff(config.download_initial_backoff_ms, attempt);
+                warn!(
+                    "download attempt failed job_id={} attempt={} max_attempts={} retry_backoff_ms={} error={}",
+                    id,
+                    attempt,
+                    attempts,
+                    delay.as_millis(),
+                    error
+                );
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+            }
         }
     }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("download failed without running an attempt")))
+}
+
+async fn prepare_download_dir(job_dir: &Path) -> anyhow::Result<()> {
+    if job_dir.exists() {
+        fs::remove_dir_all(job_dir).await.with_context(|| {
+            format!(
+                "failed to clear existing download dir {}",
+                job_dir.display()
+            )
+        })?;
+    }
+    fs::create_dir_all(job_dir)
+        .await
+        .with_context(|| format!("failed to create download dir {}", job_dir.display()))
+}
+
+fn retry_backoff(initial_backoff_ms: u64, failed_attempt: usize) -> Duration {
+    if initial_backoff_ms == 0 {
+        return Duration::ZERO;
+    }
+    let exponent = failed_attempt.saturating_sub(1).min(20);
+    let multiplier = 1_u64.checked_shl(exponent as u32).unwrap_or(u64::MAX);
+    Duration::from_millis(initial_backoff_ms.saturating_mul(multiplier))
 }
 
 pub fn download_command_args(
@@ -521,6 +567,70 @@ JSON
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn download_url_retries_failed_attempt_with_backoff() {
+        let root = temp_dir("fake-retry");
+        fs::create_dir_all(&root).await.unwrap();
+        let counter = root.join("attempts");
+        let command = fake_yt_dlp(
+            &root,
+            &format!(
+                r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo fake-yt-dlp
+  exit 0
+fi
+dir=""
+template=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --paths) shift; dir="${{1#home:}}" ;;
+    -o) shift; template="$1" ;;
+  esac
+  shift
+done
+base="${{template%%.*}}"
+attempts_file="{}"
+attempts=0
+if [ -f "$attempts_file" ]; then
+  attempts="$(cat "$attempts_file")"
+fi
+attempts=$((attempts + 1))
+printf '%s' "$attempts" > "$attempts_file"
+mkdir -p "$dir"
+if [ "$attempts" -eq 1 ]; then
+  printf partial > "$dir/partial.part"
+  echo transient failure >&2
+  exit 7
+fi
+printf 'video' > "$dir/$base.mp4"
+cat > "$dir/$base.info.json" <<JSON
+{{"webpage_url":"https://www.youtube.com/shorts/abc","extractor":"Fake","title":"Fake title","ext":"mp4"}}
+JSON
+"#,
+                counter.display()
+            ),
+        )
+        .await;
+        let mut config = test_config();
+        config.yt_dlp_command = command.to_string_lossy().into_owned();
+        config.downloads_dir = root.join("downloads");
+        config.download_max_attempts = 2;
+        config.download_initial_backoff_ms = 0;
+        let id = Uuid::new_v4();
+
+        let metadata = download_url(&config, id, "https://www.youtube.com/shorts/abc")
+            .await
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(counter).await.unwrap(), "2");
+        assert_eq!(metadata.media_bytes, 5);
+        assert!(!metadata.media_path.with_file_name("partial.part").exists());
+
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn download_url_cleans_partial_directory_on_failure() {
         let root = temp_dir("fake-failure");
         fs::create_dir_all(&root).await.unwrap();
@@ -659,6 +769,8 @@ exit 0
             proxy: None,
             max_urls_per_request: 100,
             job_timeout_seconds: 300,
+            download_max_attempts: 1,
+            download_initial_backoff_ms: 0,
             max_download_storage_bytes: 0,
             min_free_disk_bytes: 0,
             webhook_timeout_seconds: 10,
