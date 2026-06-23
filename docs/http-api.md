@@ -77,8 +77,9 @@ The response contains one queued job per accepted URL:
     "status": "succeeded",
     "url": "https://www.instagram.com/reel/ABC/",
     "result": {
-      "media_path": "data/downloads/f0eb3aca-77c4-49a6-b7e5-7e44d0325bd5/video.mp4",
-      "media_bytes": 1234567
+      "media_path": "data/downloads/f0eb3aca-77c4-49a6-b7e5-7e44d0325bd5/f0eb3aca-77c4-49a6-b7e5-7e44d0325bd5.mp4",
+      "media_bytes": 1234567,
+      "info_json_path": "data/downloads/f0eb3aca-77c4-49a6-b7e5-7e44d0325bd5/f0eb3aca-77c4-49a6-b7e5-7e44d0325bd5.info.json"
     },
     "error": null
   }

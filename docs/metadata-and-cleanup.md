@@ -8,7 +8,7 @@ Runtime metadata is stored as JSON Lines under `data/metadata/`:
 
 On startup, the server reloads these JSONL files so completed job records remain available through `/v1/jobs/{id}` after a restart. Any job that was still `queued` or `running` when the previous process exited is recovered as `failed` and appended to `download_results.jsonl`.
 
-Successful downloads are retained under `data/downloads/<job-id>/`. Each directory contains the downloaded media file and the `*.info.json` file produced by `yt-dlp`.
+Successful downloads are retained under `data/downloads/<job-id>/`. Each directory contains the downloaded media file named `<job-id>.<ext>` and the metadata file named `<job-id>.info.json`.
 
 Failed or timed-out downloads remove their partial `data/downloads/<job-id>/` directory on a best-effort basis.
 

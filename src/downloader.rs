@@ -9,6 +9,7 @@ use anyhow::{Context, anyhow};
 use log::{debug, warn};
 use serde_json::Value;
 use tokio::{fs, process::Command};
+use uuid::Uuid;
 
 use crate::{config::Config, types::DownloadMetadata};
 
@@ -39,7 +40,7 @@ pub async fn download_url(
         "unknown".to_string()
     });
 
-    let outcome = run_yt_dlp(config, &job_dir, url).await;
+    let outcome = run_yt_dlp(config, id, &job_dir, url).await;
     match outcome {
         Ok(()) => {
             metadata_from_download_dir(&job_dir, url, version, started.elapsed().as_millis()).await
@@ -51,7 +52,12 @@ pub async fn download_url(
     }
 }
 
-pub fn download_command_args(config: &Config, job_dir: &Path, url: &str) -> Vec<OsString> {
+pub fn download_command_args(
+    config: &Config,
+    id: Uuid,
+    job_dir: &Path,
+    url: &str,
+) -> Vec<OsString> {
     let mut args = yt_dlp_prefix_args(config);
     args.extend([
         OsString::from("--no-config"),
@@ -61,7 +67,7 @@ pub fn download_command_args(config: &Config, job_dir: &Path, url: &str) -> Vec<
         OsString::from("--paths"),
         OsString::from(format!("home:{}", job_dir.display())),
         OsString::from("-o"),
-        OsString::from("%(title).200B [%(id)s].%(ext)s"),
+        OsString::from(format!("{id}.%(ext)s")),
     ]);
     if let Some(cookies_path) = &config.cookies_path {
         args.push(OsString::from("--cookies"));
@@ -77,10 +83,10 @@ pub fn version_command_args(config: &Config) -> Vec<OsString> {
     args
 }
 
-async fn run_yt_dlp(config: &Config, job_dir: &Path, url: &str) -> anyhow::Result<()> {
+async fn run_yt_dlp(config: &Config, id: Uuid, job_dir: &Path, url: &str) -> anyhow::Result<()> {
     let output = run_command_with_timeout(
         &config.yt_dlp_command,
-        download_command_args(config, job_dir, url),
+        download_command_args(config, id, job_dir, url),
         config.job_timeout_seconds,
     )
     .await?;
@@ -298,9 +304,11 @@ mod tests {
     fn builds_uv_download_command_with_cookie_file() {
         let mut config = test_config();
         config.cookies_path = Some(PathBuf::from("cookies.txt"));
+        let id = Uuid::parse_str("10af7128-4b98-4e19-a494-17a3d5597e2c").unwrap();
 
         let args = download_command_args(
             &config,
+            id,
             Path::new("data/downloads/job"),
             "https://www.tiktok.com/@user/video/123",
         )
@@ -309,6 +317,7 @@ mod tests {
         .collect::<Vec<_>>();
 
         assert_eq!(&args[0..3], ["run", "--frozen", "yt-dlp"]);
+        assert!(args.contains(&format!("{id}.%(ext)s")));
         assert!(args.contains(&"--cookies".to_string()));
         assert!(args.contains(&"cookies.txt".to_string()));
         assert_eq!(
@@ -321,9 +330,11 @@ mod tests {
     fn builds_direct_download_command_without_uv_prefix() {
         let mut config = test_config();
         config.yt_dlp_command = "/tmp/fake-yt-dlp".to_string();
+        let id = Uuid::parse_str("10af7128-4b98-4e19-a494-17a3d5597e2c").unwrap();
 
         let args = download_command_args(
             &config,
+            id,
             Path::new("data/downloads/job"),
             "https://www.instagram.com/reel/abc/",
         )
@@ -332,6 +343,7 @@ mod tests {
         .collect::<Vec<_>>();
 
         assert_eq!(args.first().unwrap(), "--no-config");
+        assert!(args.contains(&format!("{id}.%(ext)s")));
         assert!(!args.contains(&"--cookies".to_string()));
     }
 
@@ -339,8 +351,9 @@ mod tests {
     async fn extracts_download_metadata_from_info_json_and_media_file() {
         let dir = temp_dir("metadata");
         fs::create_dir_all(&dir).await.unwrap();
-        let info_path = dir.join("clip.info.json");
-        let media_path = dir.join("clip.mp4");
+        let id = Uuid::parse_str("10af7128-4b98-4e19-a494-17a3d5597e2c").unwrap();
+        let info_path = dir.join(format!("{id}.info.json"));
+        let media_path = dir.join(format!("{id}.mp4"));
         fs::write(
             &info_path,
             r#"{
