@@ -304,6 +304,11 @@ struct RuntimeDownloadConfig {
     initial_backoff_ms: u64,
     max_storage_bytes: u64,
     min_free_disk_bytes: u64,
+    post_processing_enabled: bool,
+    post_processing_command_count: usize,
+    object_storage_backend: String,
+    object_storage_configured: bool,
+    object_storage_public_urls: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -675,6 +680,11 @@ fn runtime_config_response(config: &Config) -> RuntimeConfigResponse {
             initial_backoff_ms: config.download_initial_backoff_ms,
             max_storage_bytes: config.max_download_storage_bytes,
             min_free_disk_bytes: config.min_free_disk_bytes,
+            post_processing_enabled: config.post_processing.enabled,
+            post_processing_command_count: config.post_processing.commands.len(),
+            object_storage_backend: config.object_storage.backend.as_str().to_string(),
+            object_storage_configured: config.object_storage.bucket.is_some(),
+            object_storage_public_urls: config.object_storage.public_base_url.is_some(),
         },
         webhooks: RuntimeWebhookConfig {
             timeout_seconds: config.webhook_timeout_seconds,
@@ -4445,7 +4455,7 @@ fn openapi_document() -> Value {
                 },
                 "RuntimeDownloadConfig": {
                     "type": "object",
-                    "required": ["workers", "output_dir", "yt_dlp_command", "cookies_configured", "cookie_profiles", "format_configured", "proxy_configured", "enabled_platforms", "platform_policies", "max_urls_per_request", "job_timeout_seconds", "max_attempts", "initial_backoff_ms", "max_storage_bytes", "min_free_disk_bytes"],
+                    "required": ["workers", "output_dir", "yt_dlp_command", "cookies_configured", "cookie_profiles", "format_configured", "proxy_configured", "enabled_platforms", "platform_policies", "max_urls_per_request", "job_timeout_seconds", "max_attempts", "initial_backoff_ms", "max_storage_bytes", "min_free_disk_bytes", "post_processing_enabled", "post_processing_command_count", "object_storage_backend", "object_storage_configured", "object_storage_public_urls"],
                     "properties": {
                         "workers": { "type": "integer", "minimum": 1 },
                         "output_dir": { "type": "string" },
@@ -4461,7 +4471,12 @@ fn openapi_document() -> Value {
                         "max_attempts": { "type": "integer", "minimum": 1 },
                         "initial_backoff_ms": { "type": "integer", "minimum": 0 },
                         "max_storage_bytes": { "type": "integer", "minimum": 0 },
-                        "min_free_disk_bytes": { "type": "integer", "minimum": 0 }
+                        "min_free_disk_bytes": { "type": "integer", "minimum": 0 },
+                        "post_processing_enabled": { "type": "boolean" },
+                        "post_processing_command_count": { "type": "integer", "minimum": 0 },
+                        "object_storage_backend": { "type": "string", "enum": ["local", "s3"] },
+                        "object_storage_configured": { "type": "boolean" },
+                        "object_storage_public_urls": { "type": "boolean" }
                     }
                 },
                 "RuntimePlatformDownloadPolicy": {
@@ -5445,6 +5460,8 @@ mod tests {
             info_json_path: PathBuf::from("data/downloads/job/info.json"),
             yt_dlp_version: "test".to_string(),
             elapsed_ms: 123,
+            post_processing: Vec::new(),
+            storage: None,
         });
         state.jobs.write().await.insert(record.id, record.clone());
         let app = router(state);
@@ -5538,6 +5555,8 @@ mod tests {
             info_json_path,
             yt_dlp_version: "2026.01.01".to_string(),
             elapsed_ms: 1234,
+            post_processing: Vec::new(),
+            storage: None,
         });
         state.jobs.write().await.insert(record.id, record.clone());
         let app = router(state);
@@ -6086,6 +6105,8 @@ mod tests {
             info_json_path: PathBuf::from("data/downloads/job/info.json"),
             yt_dlp_version: "test".to_string(),
             elapsed_ms: 123,
+            post_processing: Vec::new(),
+            storage: None,
         });
         let tiktok = test_job(
             JobStatus::Succeeded,
@@ -6788,6 +6809,8 @@ mod tests {
             info_json_path,
             yt_dlp_version: "test".to_string(),
             elapsed_ms: 1,
+            post_processing: Vec::new(),
+            storage: None,
         });
         state.jobs.write().await.insert(record.id, record.clone());
         let app = router(state.clone());
@@ -6878,6 +6901,8 @@ mod tests {
             info_json_path,
             yt_dlp_version: "test".to_string(),
             elapsed_ms: 1,
+            post_processing: Vec::new(),
+            storage: None,
         });
         state.jobs.write().await.insert(record.id, record.clone());
         let app = router(state.clone());
@@ -7041,6 +7066,8 @@ mod tests {
             info_json_path,
             yt_dlp_version: "test".to_string(),
             elapsed_ms: 1,
+            post_processing: Vec::new(),
+            storage: None,
         });
         state.jobs.write().await.insert(record.id, record.clone());
         let app = router(state.clone());
@@ -7086,6 +7113,8 @@ mod tests {
             info_json_path,
             yt_dlp_version: "test".to_string(),
             elapsed_ms: 1,
+            post_processing: Vec::new(),
+            storage: None,
         });
         state.jobs.write().await.insert(record.id, record.clone());
         let app = router(state.clone());
@@ -7133,6 +7162,8 @@ mod tests {
             info_json_path,
             yt_dlp_version: "test".to_string(),
             elapsed_ms: 1,
+            post_processing: Vec::new(),
+            storage: None,
         });
         state.jobs.write().await.insert(record.id, record.clone());
         let app = router(state.clone());
@@ -7178,6 +7209,8 @@ mod tests {
             info_json_path,
             yt_dlp_version: "test".to_string(),
             elapsed_ms: 1,
+            post_processing: Vec::new(),
+            storage: None,
         });
         state.jobs.write().await.insert(record.id, record.clone());
         let app = router(state.clone());
@@ -7223,6 +7256,8 @@ mod tests {
             info_json_path,
             yt_dlp_version: "test".to_string(),
             elapsed_ms: 1,
+            post_processing: Vec::new(),
+            storage: None,
         });
         state.jobs.write().await.insert(record.id, record.clone());
         let app = router(state.clone());
@@ -7336,6 +7371,8 @@ mod tests {
             info_json_path,
             yt_dlp_version: "test".to_string(),
             elapsed_ms: 1,
+            post_processing: Vec::new(),
+            storage: None,
         });
         state.jobs.write().await.insert(record.id, record.clone());
         let app = router(state.clone());
@@ -7580,6 +7617,8 @@ mod tests {
             info_json_path,
             yt_dlp_version: "test".to_string(),
             elapsed_ms: 1,
+            post_processing: Vec::new(),
+            storage: None,
         });
         state.jobs.write().await.insert(record.id, record.clone());
         let app = router(state.clone());
@@ -7667,6 +7706,8 @@ mod tests {
             info_json_path,
             yt_dlp_version: "test".to_string(),
             elapsed_ms: 1,
+            post_processing: Vec::new(),
+            storage: None,
         });
         state.jobs.write().await.insert(record.id, record.clone());
         let app = router(state.clone());
@@ -7728,6 +7769,23 @@ mod tests {
             download_initial_backoff_ms: 0,
             max_download_storage_bytes: 0,
             min_free_disk_bytes: 0,
+            post_processing: crate::config::PostProcessingConfig {
+                enabled: false,
+                fail_job_on_error: true,
+                commands: Vec::new(),
+            },
+            object_storage: crate::config::ObjectStorageConfig {
+                backend: crate::config::ObjectStorageBackend::Local,
+                endpoint_url: None,
+                bucket: None,
+                region: "us-east-1".to_string(),
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
+                prefix: String::new(),
+                force_path_style: true,
+                public_base_url: None,
+            },
             webhook_timeout_seconds: 10,
             webhook_connect_timeout_seconds: 5,
             webhook_max_attempts: 1,
@@ -7783,6 +7841,8 @@ mod tests {
             info_json_path: job_dir.join(format!("{}.info.json", record.id)),
             yt_dlp_version: "test".to_string(),
             elapsed_ms: 1,
+            post_processing: Vec::new(),
+            storage: None,
         }
     }
 
@@ -7816,6 +7876,8 @@ mod tests {
             info_json_path,
             yt_dlp_version: "test".to_string(),
             elapsed_ms: 1,
+            post_processing: Vec::new(),
+            storage: None,
         });
         state.jobs.write().await.insert(record.id, record.clone());
         record

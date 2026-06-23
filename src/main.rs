@@ -6,6 +6,7 @@ mod downloader;
 mod jobs;
 mod platforms;
 mod state;
+mod storage;
 mod templates;
 mod types;
 mod util;

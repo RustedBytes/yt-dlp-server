@@ -12,6 +12,8 @@ On graceful shutdown, the HTTP server stops accepting requests, the in-process q
 
 Successful downloads are retained under `data/downloads/<job-id>/`. Each directory contains the downloaded media file named `<job-id>.<ext>` and the metadata file named `<job-id>.info.json`.
 
+If post-processing is enabled, configured commands run after `yt-dlp` succeeds. Step results are persisted in `result.post_processing`. If object storage is enabled, the post-processed media file and `info.json` are uploaded after post-processing, and object metadata is persisted in `result.storage`.
+
 Failed or timed-out downloads remove their partial `data/downloads/<job-id>/` directory on a best-effort basis.
 
 When `download.download_max_attempts` is greater than `1`, failed `yt-dlp` attempts are retried with exponential backoff starting at `download.download_initial_backoff_ms`. Each retry starts from a clean `data/downloads/<job-id>/` directory, so partial files from previous attempts are not retained. Final job records persist `attempts` and `attempt_errors` for API reads and webhook payloads.

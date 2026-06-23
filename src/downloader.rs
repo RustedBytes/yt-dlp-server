@@ -16,8 +16,9 @@ use tokio::{fs, io::AsyncReadExt, process::Command, task::JoinHandle};
 use uuid::Uuid;
 
 use crate::{
-    config::{Config, EffectiveDownloadPolicy},
-    types::{DownloadAttempt, DownloadMetadata},
+    config::{Config, EffectiveDownloadPolicy, PostProcessingCommand},
+    storage::store_download_artifacts,
+    types::{DownloadAttempt, DownloadMetadata, PostProcessingStepResult},
 };
 
 #[derive(Debug)]
@@ -96,11 +97,14 @@ pub async fn download_url(
         .await
         {
             Ok(()) => {
-                metadata_from_download_dir(
+                finalize_download_metadata(
+                    config,
+                    id,
                     &job_dir,
                     url,
                     version.clone(),
                     started.elapsed().as_millis(),
+                    Arc::clone(&cancel_flag),
                 )
                 .await
             }
@@ -154,6 +158,28 @@ pub async fn download_url(
         attempts,
         attempt_errors,
     ))
+}
+
+async fn finalize_download_metadata(
+    config: &Config,
+    id: Uuid,
+    job_dir: &Path,
+    url: &str,
+    yt_dlp_version: String,
+    elapsed_ms: u128,
+    cancel_flag: Arc<AtomicBool>,
+) -> anyhow::Result<DownloadMetadata> {
+    let mut metadata =
+        metadata_from_download_dir(job_dir, url, yt_dlp_version.clone(), elapsed_ms).await?;
+    metadata.post_processing =
+        run_post_processing(config, id, job_dir, &metadata, Arc::clone(&cancel_flag)).await?;
+    if !metadata.post_processing.is_empty() {
+        let post_processing = metadata.post_processing;
+        metadata = metadata_from_download_dir(job_dir, url, yt_dlp_version, elapsed_ms).await?;
+        metadata.post_processing = post_processing;
+    }
+    metadata.storage = store_download_artifacts(config, id, &metadata).await?;
+    Ok(metadata)
 }
 
 fn download_error(
@@ -289,6 +315,124 @@ async fn run_yt_dlp(
         output.stderr.len()
     );
     Ok(())
+}
+
+async fn run_post_processing(
+    config: &Config,
+    id: Uuid,
+    job_dir: &Path,
+    metadata: &DownloadMetadata,
+    cancel_flag: Arc<AtomicBool>,
+) -> anyhow::Result<Vec<PostProcessingStepResult>> {
+    if !config.post_processing.enabled || config.post_processing.commands.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut results = Vec::new();
+    for (index, command) in config.post_processing.commands.iter().enumerate() {
+        let result = run_post_processing_command(
+            index,
+            command,
+            id,
+            job_dir,
+            metadata,
+            Arc::clone(&cancel_flag),
+        )
+        .await;
+        let step = match result {
+            Ok(step) => step,
+            Err(err) => PostProcessingStepResult {
+                command_index: index,
+                program: command.program.clone(),
+                success: false,
+                status_code: None,
+                elapsed_ms: 0,
+                stdout_tail: None,
+                stderr_tail: None,
+                error: Some(err.to_string()),
+            },
+        };
+        let failed = !step.success;
+        let error = step.error.clone();
+        results.push(step);
+        if failed {
+            if config.post_processing.fail_job_on_error {
+                return Err(anyhow!(
+                    "post-processing command {} failed: {}",
+                    index,
+                    error.unwrap_or_else(|| "command returned non-zero status".to_string())
+                ));
+            }
+            break;
+        }
+    }
+    Ok(results)
+}
+
+async fn run_post_processing_command(
+    index: usize,
+    command: &PostProcessingCommand,
+    id: Uuid,
+    job_dir: &Path,
+    metadata: &DownloadMetadata,
+    cancel_flag: Arc<AtomicBool>,
+) -> anyhow::Result<PostProcessingStepResult> {
+    let started = Instant::now();
+    let args = command
+        .args
+        .iter()
+        .map(|arg| expand_post_processing_arg(arg, id, job_dir, metadata))
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    let output =
+        run_command_with_timeout(&command.program, args, command.timeout_seconds, cancel_flag)
+            .await?;
+    let stdout_tail = output_tail(&output.stdout);
+    let stderr_tail = output_tail(&output.stderr);
+    let success = output.status.success();
+    let error = (!success).then(|| {
+        format!(
+            "post-processing command exited with status {}: {}",
+            output.status,
+            process_output_summary(&output.stderr, &output.stdout)
+        )
+    });
+
+    debug!(
+        "post-processing command finished index={} program={} success={} stdout_bytes={} stderr_bytes={}",
+        index,
+        command.program,
+        success,
+        output.stdout.len(),
+        output.stderr.len()
+    );
+
+    Ok(PostProcessingStepResult {
+        command_index: index,
+        program: command.program.clone(),
+        success,
+        status_code: output.status.code(),
+        elapsed_ms: started.elapsed().as_millis(),
+        stdout_tail,
+        stderr_tail,
+        error,
+    })
+}
+
+fn expand_post_processing_arg(
+    value: &str,
+    id: Uuid,
+    job_dir: &Path,
+    metadata: &DownloadMetadata,
+) -> String {
+    value
+        .replace("{job_id}", &id.to_string())
+        .replace("{job_dir}", &job_dir.display().to_string())
+        .replace("{media_path}", &metadata.media_path.display().to_string())
+        .replace(
+            "{info_json_path}",
+            &metadata.info_json_path.display().to_string(),
+        )
 }
 
 async fn yt_dlp_version(config: &Config) -> anyhow::Result<String> {
@@ -471,6 +615,8 @@ async fn metadata_from_download_dir(
         info_json_path,
         yt_dlp_version,
         elapsed_ms,
+        post_processing: Vec::new(),
+        storage: None,
     })
 }
 
@@ -574,6 +720,18 @@ fn process_output_summary(stderr: &[u8], stdout: &[u8]) -> String {
         return "<no process output>".to_string();
     }
     text.chars().take(2_000).collect()
+}
+
+fn output_tail(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    if text.is_empty() {
+        None
+    } else {
+        let mut chars = text.chars().rev().take(2_000).collect::<Vec<_>>();
+        chars.reverse();
+        Some(chars.into_iter().collect())
+    }
 }
 
 #[cfg(test)]
@@ -855,6 +1013,82 @@ JSON
                 .join(format!("{id}.info.json"))
         );
         assert_eq!(metadata.media_bytes, 5);
+
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_url_runs_post_processing_commands_before_returning_metadata() {
+        let root = temp_dir("fake-post-processing");
+        fs::create_dir_all(&root).await.unwrap();
+        let command = fake_yt_dlp(
+            &root,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo fake-yt-dlp
+  exit 0
+fi
+dir=""
+template=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --paths) shift; dir="${1#home:}" ;;
+    -o) shift; template="$1" ;;
+  esac
+  shift
+done
+base="${template%%.*}"
+mkdir -p "$dir"
+printf 'video' > "$dir/$base.mp4"
+cat > "$dir/$base.info.json" <<JSON
+{"webpage_url":"https://www.youtube.com/shorts/abc","extractor":"Fake","title":"Fake title","ext":"mp4"}
+JSON
+"#,
+        )
+        .await;
+        let postprocess = fake_executable(
+            &root,
+            "fake-postprocess",
+            r#"#!/bin/sh
+printf processed >> "$1"
+echo postprocessed
+"#,
+        )
+        .await;
+        let mut config = test_config();
+        config.yt_dlp_command = command.to_string_lossy().into_owned();
+        config.downloads_dir = root.join("downloads");
+        config.post_processing.enabled = true;
+        config
+            .post_processing
+            .commands
+            .push(crate::config::PostProcessingCommand {
+                program: postprocess.to_string_lossy().into_owned(),
+                args: vec!["{media_path}".to_string()],
+                timeout_seconds: 5,
+            });
+        let id = Uuid::new_v4();
+
+        let report = download_url(
+            &config,
+            id,
+            "https://www.youtube.com/shorts/abc",
+            None,
+            None,
+            cancel_flag(),
+        )
+        .await
+        .unwrap();
+        let metadata = report.metadata;
+
+        assert_eq!(metadata.media_bytes, "videoprocessed".len() as u64);
+        assert_eq!(metadata.post_processing.len(), 1);
+        assert!(metadata.post_processing[0].success);
+        assert_eq!(
+            metadata.post_processing[0].stdout_tail.as_deref(),
+            Some("postprocessed")
+        );
 
         fs::remove_dir_all(root).await.unwrap();
     }
@@ -1158,6 +1392,23 @@ exit 0
             download_initial_backoff_ms: 0,
             max_download_storage_bytes: 0,
             min_free_disk_bytes: 0,
+            post_processing: crate::config::PostProcessingConfig {
+                enabled: false,
+                fail_job_on_error: true,
+                commands: Vec::new(),
+            },
+            object_storage: crate::config::ObjectStorageConfig {
+                backend: crate::config::ObjectStorageBackend::Local,
+                endpoint_url: None,
+                bucket: None,
+                region: "us-east-1".to_string(),
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
+                prefix: String::new(),
+                force_path_style: true,
+                public_base_url: None,
+            },
             webhook_timeout_seconds: 10,
             webhook_connect_timeout_seconds: 5,
             webhook_max_attempts: 1,
@@ -1182,9 +1433,13 @@ exit 0
 
     #[cfg(unix)]
     async fn fake_yt_dlp(root: &Path, script: &str) -> PathBuf {
+        fake_executable(root, "fake-yt-dlp", script).await
+    }
+
+    async fn fake_executable(root: &Path, name: &str, script: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
-        let path = root.join("fake-yt-dlp");
+        let path = root.join(name);
         fs::write(&path, script).await.unwrap();
         let mut permissions = fs::metadata(&path).await.unwrap().permissions();
         permissions.set_mode(0o755);

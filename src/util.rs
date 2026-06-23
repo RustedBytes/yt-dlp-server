@@ -43,14 +43,16 @@ pub async fn append_jsonl(path: &Path, value: &impl Serialize) -> anyhow::Result
 }
 
 pub fn hmac_sha256_hex(secret: &str, bytes: &[u8]) -> String {
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts secrets of any length");
-    mac.update(bytes);
-    mac.finalize()
-        .into_bytes()
+    hmac_sha256_bytes(secret.as_bytes(), bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+pub fn hmac_sha256_bytes(key: &[u8], bytes: &[u8]) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts secrets of any length");
+    mac.update(bytes);
+    mac.finalize().into_bytes().to_vec()
 }
 
 pub async fn sha256_file_hex(path: &Path) -> std::io::Result<String> {

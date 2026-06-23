@@ -98,6 +98,42 @@ pub struct DownloadMetadata {
     pub info_json_path: PathBuf,
     pub yt_dlp_version: String,
     pub elapsed_ms: u128,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post_processing: Vec<PostProcessingStepResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StoredArtifacts>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostProcessingStepResult {
+    pub command_index: usize,
+    pub program: String,
+    pub success: bool,
+    pub status_code: Option<i32>,
+    pub elapsed_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_tail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_tail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredArtifacts {
+    pub backend: String,
+    pub bucket: Option<String>,
+    pub media: StoredObject,
+    pub info_json: StoredObject,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredObject {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    pub bytes: u64,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

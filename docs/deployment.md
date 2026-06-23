@@ -30,13 +30,20 @@ min_free_disk_bytes = 1073741824
 [download.platforms.instagram]
 max_concurrent = 1
 
+[post_processing]
+enabled = false
+fail_job_on_error = true
+
+[storage]
+backend = "local"
+
 [webhooks]
 webhook_max_attempts = 3
 webhook_initial_backoff_ms = 500
 webhook_signing_secret = "replace-with-a-long-random-secret"
 ```
 
-Keep cookie files and API keys outside the repository. Mount cookie files read-only in containers.
+Keep cookie files, API keys, and object-storage credentials outside the repository. Mount cookie files read-only in containers. Use `[storage] backend = "s3"` with an S3-compatible endpoint, bucket, and credentials when completed artifacts should be mirrored to S3/R2/MinIO.
 
 ## systemd
 

@@ -54,6 +54,27 @@ download_max_attempts = 3
 download_initial_backoff_ms = 1000
 max_concurrent = 1
 
+[post_processing]
+enabled = false
+fail_job_on_error = true
+
+[[post_processing.commands]]
+program = "ffmpeg"
+args = ["-y", "-i", "{media_path}", "-map_metadata", "-1", "{job_dir}/{job_id}.processed.mp4"]
+timeout_seconds = 600
+
+[storage]
+backend = "local"
+endpoint_url = ""
+bucket = ""
+region = "us-east-1"
+access_key_id = ""
+secret_access_key = ""
+session_token = ""
+prefix = ""
+force_path_style = true
+public_base_url = ""
+
 [webhooks]
 webhook_timeout_seconds = 10
 webhook_connect_timeout_seconds = 5
@@ -89,6 +110,18 @@ Environment variables override TOML values when set:
 - `DOWNLOAD_INITIAL_BACKOFF_MS`: initial retry backoff in milliseconds; later retries double this delay; set to `0` for immediate retries
 - `MAX_DOWNLOAD_STORAGE_BYTES`: maximum retained downloaded media bytes; set to `0` to disable automatic cleanup
 - `MIN_FREE_DISK_BYTES`: minimum free bytes required in the download directory before starting a job; set to `0` to disable the preflight check
+- `POST_PROCESSING_ENABLED`: enable configured post-processing commands
+- `POST_PROCESSING_FAIL_JOB_ON_ERROR`: fail the job when a post-processing command fails; defaults to `true`
+- `OBJECT_STORAGE_BACKEND`: `local` or `s3`; `local` is the default
+- `OBJECT_STORAGE_ENDPOINT_URL`: S3-compatible endpoint URL when `OBJECT_STORAGE_BACKEND=s3`
+- `OBJECT_STORAGE_BUCKET`: S3/R2/MinIO bucket name
+- `OBJECT_STORAGE_REGION`: SigV4 region, default `us-east-1`
+- `OBJECT_STORAGE_ACCESS_KEY_ID`: S3-compatible access key
+- `OBJECT_STORAGE_SECRET_ACCESS_KEY`: S3-compatible secret key
+- `OBJECT_STORAGE_SESSION_TOKEN`: optional temporary credential token
+- `OBJECT_STORAGE_PREFIX`: optional object key prefix
+- `OBJECT_STORAGE_FORCE_PATH_STYLE`: defaults to `true`, useful for MinIO/R2-style endpoints
+- `OBJECT_STORAGE_PUBLIC_BASE_URL`: optional CDN/public base URL used in stored object metadata
 - `JOB_RETENTION_LIMIT`: maximum in-memory job records kept queryable through `/v1/jobs/{id}`
 - `METADATA_RETENTION_LIMIT`: maximum latest metadata records kept when JSONL files are compacted at startup; set to `0` to disable compaction
 - `WEBHOOK_TIMEOUT_SECONDS`: total outbound webhook request timeout; set to `0` to disable
@@ -105,3 +138,7 @@ Environment variables override TOML values when set:
 Per-platform tables under `[download.platforms.<platform-id>]` override the global cookies, format, proxy, timeout, max attempts, and retry backoff for that platform. They may also set `max_concurrent` to cap how many downloads for that platform run at once across all workers. Omit a field to inherit `[download]`; omitting `max_concurrent` leaves that platform limited only by `download.workers`. API request `format` still has highest precedence for that job. API request `cookie_profile` has highest precedence for cookies.
 
 Cookie files are server-side configuration only. API requests cannot submit cookies or credentials.
+
+Post-processing commands run after a successful `yt-dlp` download and before object-storage upload. Commands are executed directly with argument arrays, not through shell interpolation. Supported placeholders are `{job_id}`, `{job_dir}`, `{media_path}`, and `{info_json_path}`. Step results are stored in each job's `result.post_processing`.
+
+When `[storage] backend = "s3"`, the server uploads the completed media file and `info.json` to an S3-compatible service after post-processing. Local files remain the staging and serving copy; object keys, byte sizes, SHA-256 hashes, and optional public URLs are stored in `result.storage`. Secret storage values are not returned by `/v1/config`.

@@ -31,6 +31,11 @@ const DEFAULT_DOWNLOAD_MAX_ATTEMPTS: usize = 3;
 const DEFAULT_DOWNLOAD_INITIAL_BACKOFF_MS: u64 = 1_000;
 const DEFAULT_MAX_DOWNLOAD_STORAGE_BYTES: u64 = 0;
 const DEFAULT_MIN_FREE_DISK_BYTES: u64 = 0;
+const DEFAULT_POST_PROCESSING_ENABLED: bool = false;
+const DEFAULT_POST_PROCESSING_FAIL_JOB_ON_ERROR: bool = true;
+const DEFAULT_OBJECT_STORAGE_BACKEND: &str = "local";
+const DEFAULT_OBJECT_STORAGE_REGION: &str = "us-east-1";
+const DEFAULT_OBJECT_STORAGE_FORCE_PATH_STYLE: bool = true;
 
 pub struct Config {
     pub addr: SocketAddr,
@@ -62,6 +67,8 @@ pub struct Config {
     pub download_initial_backoff_ms: u64,
     pub max_download_storage_bytes: u64,
     pub min_free_disk_bytes: u64,
+    pub post_processing: PostProcessingConfig,
+    pub object_storage: ObjectStorageConfig,
     pub webhook_timeout_seconds: u64,
     pub webhook_connect_timeout_seconds: u64,
     pub webhook_max_attempts: usize,
@@ -92,12 +99,57 @@ pub struct EffectiveDownloadPolicy {
     pub download_initial_backoff_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostProcessingConfig {
+    pub enabled: bool,
+    pub fail_job_on_error: bool,
+    pub commands: Vec<PostProcessingCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostProcessingCommand {
+    pub program: String,
+    pub args: Vec<String>,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectStorageConfig {
+    pub backend: ObjectStorageBackend,
+    pub endpoint_url: Option<String>,
+    pub bucket: Option<String>,
+    pub region: String,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    pub session_token: Option<String>,
+    pub prefix: String,
+    pub force_path_style: bool,
+    pub public_base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectStorageBackend {
+    Local,
+    S3,
+}
+
+impl ObjectStorageBackend {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::S3 => "s3",
+        }
+    }
+}
+
 impl Config {
     pub fn load(config_path: Option<PathBuf>) -> anyhow::Result<Self> {
         let file_config = FileConfig::load(config_path)?;
         let server = file_config.server.unwrap_or_default();
         let queue = file_config.queue.unwrap_or_default();
         let download = file_config.download.unwrap_or_default();
+        let post_processing = file_config.post_processing.unwrap_or_default();
+        let storage = file_config.storage.unwrap_or_default();
         let webhooks = file_config.webhooks.unwrap_or_default();
         let logging = file_config.logging.unwrap_or_default();
         let retention = file_config.retention.unwrap_or_default();
@@ -204,6 +256,8 @@ impl Config {
                 download.min_free_disk_bytes,
                 DEFAULT_MIN_FREE_DISK_BYTES,
             )?,
+            post_processing: post_processing_setting(post_processing)?,
+            object_storage: object_storage_setting(storage)?,
             webhook_timeout_seconds: u64_setting(
                 "WEBHOOK_TIMEOUT_SECONDS",
                 webhooks.webhook_timeout_seconds,
@@ -289,6 +343,8 @@ struct FileConfig {
     server: Option<ServerConfig>,
     queue: Option<QueueConfig>,
     download: Option<DownloadConfig>,
+    post_processing: Option<PostProcessingFileConfig>,
+    storage: Option<ObjectStorageFileConfig>,
     webhooks: Option<WebhookConfig>,
     logging: Option<LoggingConfig>,
     retention: Option<RetentionConfig>,
@@ -364,6 +420,34 @@ struct PlatformDownloadConfig {
     download_max_attempts: Option<usize>,
     download_initial_backoff_ms: Option<u64>,
     max_concurrent: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PostProcessingFileConfig {
+    enabled: Option<bool>,
+    fail_job_on_error: Option<bool>,
+    commands: Option<Vec<PostProcessingCommandConfig>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PostProcessingCommandConfig {
+    program: Option<String>,
+    args: Option<Vec<String>>,
+    timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ObjectStorageFileConfig {
+    backend: Option<String>,
+    endpoint_url: Option<String>,
+    bucket: Option<String>,
+    region: Option<String>,
+    access_key_id: Option<String>,
+    secret_access_key: Option<String>,
+    session_token: Option<String>,
+    prefix: Option<String>,
+    force_path_style: Option<bool>,
+    public_base_url: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -504,6 +588,122 @@ fn platform_policies_setting(
     Ok(policies)
 }
 
+fn post_processing_setting(
+    file_value: PostProcessingFileConfig,
+) -> anyhow::Result<PostProcessingConfig> {
+    let enabled = bool_setting(
+        "POST_PROCESSING_ENABLED",
+        file_value.enabled,
+        DEFAULT_POST_PROCESSING_ENABLED,
+    )?;
+    let fail_job_on_error = bool_setting(
+        "POST_PROCESSING_FAIL_JOB_ON_ERROR",
+        file_value.fail_job_on_error,
+        DEFAULT_POST_PROCESSING_FAIL_JOB_ON_ERROR,
+    )?;
+    let mut commands = Vec::new();
+    for (index, command) in file_value
+        .commands
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+    {
+        let program = optional_trimmed_string(command.program)
+            .ok_or_else(|| anyhow!("post_processing.commands[{index}].program is required"))?;
+        commands.push(PostProcessingCommand {
+            program,
+            args: command.args.unwrap_or_default(),
+            timeout_seconds: command.timeout_seconds.unwrap_or(0),
+        });
+    }
+    Ok(PostProcessingConfig {
+        enabled,
+        fail_job_on_error,
+        commands,
+    })
+}
+
+fn object_storage_setting(
+    file_value: ObjectStorageFileConfig,
+) -> anyhow::Result<ObjectStorageConfig> {
+    let backend = object_storage_backend(&string_setting(
+        "OBJECT_STORAGE_BACKEND",
+        file_value.backend,
+        DEFAULT_OBJECT_STORAGE_BACKEND,
+    ))?;
+    let endpoint_url = secret_setting("OBJECT_STORAGE_ENDPOINT_URL", file_value.endpoint_url);
+    let bucket = secret_setting("OBJECT_STORAGE_BUCKET", file_value.bucket);
+    let region = string_setting(
+        "OBJECT_STORAGE_REGION",
+        file_value.region,
+        DEFAULT_OBJECT_STORAGE_REGION,
+    );
+    let access_key_id = secret_setting("OBJECT_STORAGE_ACCESS_KEY_ID", file_value.access_key_id);
+    let secret_access_key = secret_setting(
+        "OBJECT_STORAGE_SECRET_ACCESS_KEY",
+        file_value.secret_access_key,
+    );
+    let session_token = secret_setting("OBJECT_STORAGE_SESSION_TOKEN", file_value.session_token);
+    let prefix = secret_setting("OBJECT_STORAGE_PREFIX", file_value.prefix).unwrap_or_default();
+    let force_path_style = bool_setting(
+        "OBJECT_STORAGE_FORCE_PATH_STYLE",
+        file_value.force_path_style,
+        DEFAULT_OBJECT_STORAGE_FORCE_PATH_STYLE,
+    )?;
+    let public_base_url =
+        secret_setting("OBJECT_STORAGE_PUBLIC_BASE_URL", file_value.public_base_url);
+
+    if backend == ObjectStorageBackend::S3 {
+        if endpoint_url.is_none() {
+            return Err(anyhow!(
+                "OBJECT_STORAGE_ENDPOINT_URL is required when storage.backend is s3"
+            ));
+        }
+        if bucket.is_none() {
+            return Err(anyhow!(
+                "OBJECT_STORAGE_BUCKET is required when storage.backend is s3"
+            ));
+        }
+        if access_key_id.is_none() {
+            return Err(anyhow!(
+                "OBJECT_STORAGE_ACCESS_KEY_ID is required when storage.backend is s3"
+            ));
+        }
+        if secret_access_key.is_none() {
+            return Err(anyhow!(
+                "OBJECT_STORAGE_SECRET_ACCESS_KEY is required when storage.backend is s3"
+            ));
+        }
+    }
+
+    Ok(ObjectStorageConfig {
+        backend,
+        endpoint_url,
+        bucket,
+        region,
+        access_key_id,
+        secret_access_key,
+        session_token,
+        prefix: normalize_object_prefix(&prefix),
+        force_path_style,
+        public_base_url,
+    })
+}
+
+fn object_storage_backend(value: &str) -> anyhow::Result<ObjectStorageBackend> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "local" => Ok(ObjectStorageBackend::Local),
+        "s3" => Ok(ObjectStorageBackend::S3),
+        other => Err(anyhow!(
+            "unsupported object storage backend `{other}`; supported values are local, s3"
+        )),
+    }
+}
+
+fn normalize_object_prefix(prefix: &str) -> String {
+    prefix.trim().trim_matches('/').to_string()
+}
+
 fn cookie_profiles_setting(
     file_value: Option<BTreeMap<String, PathBuf>>,
 ) -> anyhow::Result<BTreeMap<String, PathBuf>> {
@@ -600,6 +800,10 @@ mod tests {
         assert_eq!(config.download_initial_backoff_ms, 1_000);
         assert_eq!(config.max_download_storage_bytes, 0);
         assert_eq!(config.min_free_disk_bytes, 0);
+        assert!(!config.post_processing.enabled);
+        assert!(config.post_processing.fail_job_on_error);
+        assert!(config.post_processing.commands.is_empty());
+        assert_eq!(config.object_storage.backend, ObjectStorageBackend::Local);
         assert_eq!(
             config.submissions_jsonl,
             PathBuf::from("data/metadata/download_submissions.jsonl")
@@ -646,6 +850,26 @@ job_timeout_seconds = 90
 download_max_attempts = 6
 download_initial_backoff_ms = 750
 max_concurrent = 1
+
+[post_processing]
+enabled = true
+fail_job_on_error = false
+
+[[post_processing.commands]]
+program = "ffmpeg"
+args = ["-i", "{media_path}", "{job_dir}/{job_id}.processed.mp4"]
+timeout_seconds = 600
+
+[storage]
+backend = "s3"
+endpoint_url = "http://localhost:9000"
+bucket = "downloads"
+region = "us-east-1"
+access_key_id = "access"
+secret_access_key = "secret"
+prefix = "videos"
+force_path_style = true
+public_base_url = "https://cdn.example.com/videos"
 "#,
         )
         .unwrap();
@@ -688,6 +912,23 @@ max_concurrent = 1
         assert_eq!(instagram.download_max_attempts, Some(6));
         assert_eq!(instagram.download_initial_backoff_ms, Some(750));
         assert_eq!(instagram.max_concurrent, Some(1));
+        assert!(config.post_processing.enabled);
+        assert!(!config.post_processing.fail_job_on_error);
+        assert_eq!(config.post_processing.commands.len(), 1);
+        assert_eq!(config.post_processing.commands[0].program, "ffmpeg");
+        assert_eq!(config.post_processing.commands[0].timeout_seconds, 600);
+        assert_eq!(config.object_storage.backend, ObjectStorageBackend::S3);
+        assert_eq!(
+            config.object_storage.endpoint_url.as_deref(),
+            Some("http://localhost:9000")
+        );
+        assert_eq!(config.object_storage.bucket.as_deref(), Some("downloads"));
+        assert_eq!(config.object_storage.prefix, "videos");
+        assert!(config.object_storage.force_path_style);
+        assert_eq!(
+            config.object_storage.public_base_url.as_deref(),
+            Some("https://cdn.example.com/videos")
+        );
 
         fs::remove_file(path).unwrap();
     }
@@ -792,6 +1033,15 @@ cookies_path = "instagram-cookies.txt"
                 ("DOWNLOAD_INITIAL_BACKOFF_MS", "17"),
                 ("MAX_DOWNLOAD_STORAGE_BYTES", "11"),
                 ("MIN_FREE_DISK_BYTES", "13"),
+                ("POST_PROCESSING_ENABLED", "true"),
+                ("POST_PROCESSING_FAIL_JOB_ON_ERROR", "false"),
+                ("OBJECT_STORAGE_BACKEND", "s3"),
+                ("OBJECT_STORAGE_ENDPOINT_URL", "http://localhost:9000"),
+                ("OBJECT_STORAGE_BUCKET", "downloads"),
+                ("OBJECT_STORAGE_REGION", "eu-central-1"),
+                ("OBJECT_STORAGE_ACCESS_KEY_ID", "access"),
+                ("OBJECT_STORAGE_SECRET_ACCESS_KEY", "secret"),
+                ("OBJECT_STORAGE_PREFIX", "/env-prefix/"),
             ],
             || {
                 let config = Config::load(None).unwrap();
@@ -809,6 +1059,11 @@ cookies_path = "instagram-cookies.txt"
                 assert_eq!(config.download_initial_backoff_ms, 17);
                 assert_eq!(config.max_download_storage_bytes, 11);
                 assert_eq!(config.min_free_disk_bytes, 13);
+                assert!(config.post_processing.enabled);
+                assert!(!config.post_processing.fail_job_on_error);
+                assert_eq!(config.object_storage.backend, ObjectStorageBackend::S3);
+                assert_eq!(config.object_storage.region, "eu-central-1");
+                assert_eq!(config.object_storage.prefix, "env-prefix");
             },
         );
     }

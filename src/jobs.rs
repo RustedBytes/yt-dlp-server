@@ -1029,6 +1029,23 @@ mod tests {
             download_initial_backoff_ms: 0,
             max_download_storage_bytes: 0,
             min_free_disk_bytes: 0,
+            post_processing: crate::config::PostProcessingConfig {
+                enabled: false,
+                fail_job_on_error: true,
+                commands: Vec::new(),
+            },
+            object_storage: crate::config::ObjectStorageConfig {
+                backend: crate::config::ObjectStorageBackend::Local,
+                endpoint_url: None,
+                bucket: None,
+                region: "us-east-1".to_string(),
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
+                prefix: String::new(),
+                force_path_style: true,
+                public_base_url: None,
+            },
             webhook_timeout_seconds: 10,
             webhook_connect_timeout_seconds: 5,
             webhook_max_attempts: 1,
@@ -1091,6 +1108,8 @@ mod tests {
             )),
             yt_dlp_version: "test".to_string(),
             elapsed_ms: 123,
+            post_processing: Vec::new(),
+            storage: None,
         });
 
         let event = WebhookEvent::from_job(record.clone());
@@ -1367,6 +1386,8 @@ mod tests {
             info_json_path,
             yt_dlp_version: "test".to_string(),
             elapsed_ms: 1,
+            post_processing: Vec::new(),
+            storage: None,
         });
         record
     }

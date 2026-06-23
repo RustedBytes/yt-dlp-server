@@ -170,7 +170,31 @@ Set `force` to `true` to queue a fresh download even when a successful retained 
     "result": {
       "media_path": "data/downloads/f0eb3aca-77c4-49a6-b7e5-7e44d0325bd5/f0eb3aca-77c4-49a6-b7e5-7e44d0325bd5.mp4",
       "media_bytes": 1234567,
-      "info_json_path": "data/downloads/f0eb3aca-77c4-49a6-b7e5-7e44d0325bd5/f0eb3aca-77c4-49a6-b7e5-7e44d0325bd5.info.json"
+      "info_json_path": "data/downloads/f0eb3aca-77c4-49a6-b7e5-7e44d0325bd5/f0eb3aca-77c4-49a6-b7e5-7e44d0325bd5.info.json",
+      "post_processing": [
+        {
+          "command_index": 0,
+          "program": "ffmpeg",
+          "success": true,
+          "status_code": 0,
+          "elapsed_ms": 512
+        }
+      ],
+      "storage": {
+        "backend": "s3",
+        "bucket": "downloads",
+        "media": {
+          "key": "videos/f0eb3aca-77c4-49a6-b7e5-7e44d0325bd5/f0eb3aca-77c4-49a6-b7e5-7e44d0325bd5.mp4",
+          "url": "https://cdn.example.com/videos/f0eb3aca-77c4-49a6-b7e5-7e44d0325bd5/f0eb3aca-77c4-49a6-b7e5-7e44d0325bd5.mp4",
+          "bytes": 1234567,
+          "sha256": "..."
+        },
+        "info_json": {
+          "key": "videos/f0eb3aca-77c4-49a6-b7e5-7e44d0325bd5/f0eb3aca-77c4-49a6-b7e5-7e44d0325bd5.info.json",
+          "bytes": 2345,
+          "sha256": "..."
+        }
+      }
     },
     "attempts": 2,
     "attempt_errors": [

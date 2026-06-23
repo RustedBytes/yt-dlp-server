@@ -73,6 +73,32 @@ download_max_attempts = 3
 download_initial_backoff_ms = 1000
 max_concurrent = 1
 
+[post_processing]
+# Runs after yt-dlp succeeds and before object-storage upload.
+enabled = false
+fail_job_on_error = true
+
+# Commands are executed directly with argv arrays, not through a shell.
+# Supported placeholders: {job_id}, {job_dir}, {media_path}, {info_json_path}.
+#[[post_processing.commands]]
+#program = "ffmpeg"
+#args = ["-y", "-i", "{media_path}", "-map_metadata", "-1", "{job_dir}/{job_id}.processed.mp4"]
+#timeout_seconds = 600
+
+[storage]
+# local keeps artifacts only on the server filesystem. s3 uploads completed media and info JSON
+# to an S3-compatible service such as S3, R2, or MinIO after post-processing.
+backend = "local"
+endpoint_url = ""
+bucket = ""
+region = "us-east-1"
+access_key_id = ""
+secret_access_key = ""
+session_token = ""
+prefix = ""
+force_path_style = true
+public_base_url = ""
+
 [retention]
 # Limits how many jobs stay queryable in memory. Set to 0 to retain none.
 job_retention_limit = 1000
