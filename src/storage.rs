@@ -114,51 +114,26 @@ struct SignedPutRequest {
     headers: HeaderMap,
 }
 
+struct SigV4Dates {
+    amz_date: String,
+    date: String,
+}
+
+struct CanonicalRequest {
+    value: String,
+    signed_headers: &'static str,
+}
+
 fn signed_put_request(
     config: &ObjectStorageConfig,
     key: &str,
     body: &[u8],
 ) -> anyhow::Result<SignedPutRequest> {
     let url = object_url(config, key)?;
-    let now = OffsetDateTime::now_utc();
-    let amz_date = now
-        .format(&time::macros::format_description!(
-            "[year][month][day]T[hour][minute][second]Z"
-        ))
-        .context("failed to format x-amz-date")?;
-    let date = now
-        .format(&time::macros::format_description!("[year][month][day]"))
-        .context("failed to format SigV4 date scope")?;
     let payload_hash = sha256_hex(body);
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow!("object storage endpoint URL must include a host"))?;
-    let host = match url.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_string(),
-    };
+    let dates = sigv4_dates(OffsetDateTime::now_utc())?;
+    let host = url_host(&url)?;
     let session_token = config.session_token.as_deref();
-    let canonical_uri = url.path();
-    let signed_headers = if session_token.is_some() {
-        "host;x-amz-content-sha256;x-amz-date;x-amz-security-token"
-    } else {
-        "host;x-amz-content-sha256;x-amz-date"
-    };
-    let canonical_headers = match session_token {
-        Some(token) => format!(
-            "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\nx-amz-security-token:{token}\n"
-        ),
-        None => {
-            format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n")
-        }
-    };
-    let canonical_request =
-        format!("PUT\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
-    let scope = format!("{date}/{}/s3/aws4_request", config.region);
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
-        sha256_hex(canonical_request.as_bytes())
-    );
     let access_key = config
         .access_key_id
         .as_deref()
@@ -167,25 +142,115 @@ fn signed_put_request(
         .secret_access_key
         .as_deref()
         .ok_or_else(|| anyhow!("object storage secret key is not configured"))?;
-    let signing_key = signing_key(secret_key, &date, &config.region)?;
-    let signature = hex_hmac(&signing_key, string_to_sign.as_bytes())?;
-    let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
-    );
+    let canonical = canonical_put_request(&url, &host, &payload_hash, &dates, session_token);
+    let authorization = authorization_header(config, access_key, secret_key, &dates, &canonical)?;
+    let headers = signed_put_headers(&host, &payload_hash, &dates, &authorization, session_token)?;
 
+    Ok(SignedPutRequest { url, headers })
+}
+
+fn sigv4_dates(now: OffsetDateTime) -> anyhow::Result<SigV4Dates> {
+    let amz_date = now
+        .format(&time::macros::format_description!(
+            "[year][month][day]T[hour][minute][second]Z"
+        ))
+        .context("failed to format x-amz-date")?;
+    let date = now
+        .format(&time::macros::format_description!("[year][month][day]"))
+        .context("failed to format SigV4 date scope")?;
+    Ok(SigV4Dates { amz_date, date })
+}
+
+fn url_host(url: &Url) -> anyhow::Result<String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("object storage endpoint URL must include a host"))?;
+    Ok(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
+}
+
+fn canonical_put_request(
+    url: &Url,
+    host: &str,
+    payload_hash: &str,
+    dates: &SigV4Dates,
+    session_token: Option<&str>,
+) -> CanonicalRequest {
+    let signed_headers = if session_token.is_some() {
+        "host;x-amz-content-sha256;x-amz-date;x-amz-security-token"
+    } else {
+        "host;x-amz-content-sha256;x-amz-date"
+    };
+    let canonical_headers = canonical_headers(host, payload_hash, &dates.amz_date, session_token);
+    let value = format!(
+        "PUT\n{}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
+        url.path()
+    );
+    CanonicalRequest {
+        value,
+        signed_headers,
+    }
+}
+
+fn canonical_headers(
+    host: &str,
+    payload_hash: &str,
+    amz_date: &str,
+    session_token: Option<&str>,
+) -> String {
+    match session_token {
+        Some(token) => format!(
+            "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\nx-amz-security-token:{token}\n"
+        ),
+        None => {
+            format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n")
+        }
+    }
+}
+
+fn authorization_header(
+    config: &ObjectStorageConfig,
+    access_key: &str,
+    secret_key: &str,
+    dates: &SigV4Dates,
+    canonical: &CanonicalRequest,
+) -> anyhow::Result<String> {
+    let scope = format!("{}/{}/s3/aws4_request", dates.date, config.region);
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{scope}\n{}",
+        dates.amz_date,
+        sha256_hex(canonical.value.as_bytes())
+    );
+    let signing_key = signing_key(secret_key, &dates.date, &config.region)?;
+    let signature = hex_hmac(&signing_key, string_to_sign.as_bytes())?;
+    Ok(format!(
+        "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={}, Signature={signature}",
+        canonical.signed_headers
+    ))
+}
+
+fn signed_put_headers(
+    host: &str,
+    payload_hash: &str,
+    dates: &SigV4Dates,
+    authorization: &str,
+    session_token: Option<&str>,
+) -> anyhow::Result<HeaderMap> {
     let mut headers = HeaderMap::new();
-    headers.insert(HOST, header_value(&host)?);
+    headers.insert(HOST, header_value(host)?);
     headers.insert(
         HeaderName::from_static("x-amz-content-sha256"),
-        header_value(&payload_hash)?,
+        header_value(payload_hash)?,
     );
     headers.insert(
         HeaderName::from_static("x-amz-date"),
-        header_value(&amz_date)?,
+        header_value(&dates.amz_date)?,
     );
     headers.insert(
         HeaderName::from_static("authorization"),
-        header_value(&authorization)?,
+        header_value(authorization)?,
     );
     if let Some(token) = session_token {
         headers.insert(
@@ -193,8 +258,7 @@ fn signed_put_request(
             header_value(token)?,
         );
     }
-
-    Ok(SignedPutRequest { url, headers })
+    Ok(headers)
 }
 
 fn object_url(config: &ObjectStorageConfig, key: &str) -> anyhow::Result<Url> {

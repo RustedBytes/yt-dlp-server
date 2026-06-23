@@ -51,19 +51,76 @@ use crate::{
         JobDetailView, JobListItemView, JobListTemplate, JobResultView, PlatformFilterOption,
     },
     types::{
-        BatchQueueResponse, DeleteJobResponse, ErrorResponse, HealthResponse, JobListResponse,
-        JobRecord, JobStatus, MetricsResponse, QueueResponse, ReadinessResponse, WorkerHealth,
+        BatchQueueResponse, DeleteJobResponse, DownloadMetadata, ErrorResponse, HealthResponse,
+        JobListResponse, JobRecord, JobStatus, MetricsResponse, QueueResponse, ReadinessResponse,
+        WorkerHealth,
     },
     util::{append_jsonl, hex_lower, sha256_file_hex, sha256_hex},
 };
 
 const MAX_BATCH_JOB_ACTIONS: usize = 500;
+const EXPORT_JOB_CSV_HEADERS: &[&str] = &[
+    "id",
+    "status",
+    "created_at",
+    "updated_at",
+    "url",
+    "platform",
+    "webhook_url",
+    "format",
+    "cookie_profile",
+    "attempts",
+    "error_kind",
+    "error",
+    "extractor",
+    "title",
+    "uploader",
+    "duration",
+    "extension",
+    "media_path",
+    "media_bytes",
+    "info_json_path",
+    "yt_dlp_version",
+    "elapsed_ms",
+];
 
 pub fn router(state: AppState) -> Router {
     let cors_allowed_origins = state.config.cors_allowed_origins.clone();
     let request_timeout_seconds = state.config.request_timeout_seconds;
     let state_for_middleware = state.clone();
-    let mut router = Router::new()
+    let router = app_routes()
+        .layer(DefaultBodyLimit::max(state.config.body_limit_bytes))
+        .layer(middleware::from_fn_with_state(
+            state_for_middleware.clone(),
+            rate_limit,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state_for_middleware.clone(),
+            require_api_key,
+        ))
+        .with_state(state);
+
+    let router = apply_timeout_layer(router, request_timeout_seconds);
+    let router = apply_cors_layer(router, &cors_allowed_origins);
+    router
+        .layer(middleware::from_fn_with_state(
+            state_for_middleware,
+            track_request_metrics,
+        ))
+        .layer(middleware::from_fn(add_security_headers))
+}
+
+fn app_routes() -> Router<AppState> {
+    system_routes()
+        .merge(download_routes())
+        .merge(webhook_routes())
+        .merge(form_routes())
+        .merge(job_routes())
+        .merge(job_artifact_routes())
+}
+
+fn system_routes() -> Router<AppState> {
+    Router::new()
         .route("/", get(index))
         .route("/health", get(health))
         .route("/ready", get(readiness))
@@ -79,8 +136,16 @@ pub fn router(state: AppState) -> Router {
             "/v1/storage/cleanup",
             get(preview_storage_cleanup).post(run_storage_cleanup),
         )
+}
+
+fn download_routes() -> Router<AppState> {
+    Router::new()
         .route("/v1/downloads/validate", post(validate_downloads))
         .route("/v1/downloads", post(submit_downloads))
+}
+
+fn webhook_routes() -> Router<AppState> {
+    Router::new()
         .route("/v1/webhooks/dead-letters", get(list_webhook_dead_letters))
         .route(
             "/v1/webhooks/dead-letters/{event_id}/replay",
@@ -90,6 +155,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/webhooks/dead-letters/{event_id}",
             delete(dismiss_webhook_dead_letter),
         )
+}
+
+fn form_routes() -> Router<AppState> {
+    Router::new()
         .route("/downloads-form", post(submit_downloads_form))
         .route("/webhooks/dead-letters", get(webhook_dead_letters_page))
         .route(
@@ -106,6 +175,10 @@ pub fn router(state: AppState) -> Router {
         .route("/jobs-form/{id}/retry", post(retry_job_form))
         .route("/jobs-form/{id}/webhook", post(redeliver_job_webhook_form))
         .route("/jobs-form/{id}/delete", post(delete_job_form))
+}
+
+fn job_routes() -> Router<AppState> {
+    Router::new()
         .route("/v1/jobs", get(list_jobs))
         .route("/v1/jobs/summary", get(job_summary))
         .route("/v1/jobs/export", get(export_jobs))
@@ -118,6 +191,11 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/v1/jobs/{id}/retry", post(retry_job))
         .route("/v1/jobs/{id}/webhook", post(redeliver_job_webhook))
+        .route("/v1/jobs/{id}", delete(delete_job))
+}
+
+fn job_artifact_routes() -> Router<AppState> {
+    Router::new()
         .route("/v1/jobs/{id}/artifacts", get(get_job_artifacts))
         .route(
             "/v1/jobs/{id}/media",
@@ -135,37 +213,24 @@ pub fn router(state: AppState) -> Router {
             "/v1/jobs/{id}/archive",
             get(get_job_archive).head(head_job_archive),
         )
-        .route("/v1/jobs/{id}", delete(delete_job))
-        .layer(DefaultBodyLimit::max(state.config.body_limit_bytes))
-        .layer(middleware::from_fn_with_state(
-            state_for_middleware.clone(),
-            rate_limit,
-        ))
-        .layer(middleware::from_fn_with_state(
-            state_for_middleware.clone(),
-            require_api_key,
-        ))
-        .with_state(state);
+}
 
-    if request_timeout_seconds > 0 {
-        router = router.layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(request_timeout_seconds),
-        ));
+fn apply_timeout_layer(router: Router, request_timeout_seconds: u64) -> Router {
+    if request_timeout_seconds == 0 {
+        return router;
     }
+    router.layer(TimeoutLayer::with_status_code(
+        StatusCode::REQUEST_TIMEOUT,
+        Duration::from_secs(request_timeout_seconds),
+    ))
+}
 
-    let router = if cors_allowed_origins.is_empty() {
+fn apply_cors_layer(router: Router, cors_allowed_origins: &[String]) -> Router {
+    if cors_allowed_origins.is_empty() {
         router
     } else {
-        router.layer(cors_layer(&cors_allowed_origins))
-    };
-
-    router
-        .layer(middleware::from_fn_with_state(
-            state_for_middleware,
-            track_request_metrics,
-        ))
-        .layer(middleware::from_fn(add_security_headers))
+        router.layer(cors_layer(cors_allowed_origins))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -520,6 +585,31 @@ struct ValidationErrorResponse {
     message: String,
 }
 
+enum SubmitDecision {
+    Existing(QueueResponse),
+    Queue(String),
+}
+
+struct StorageCleanupExecution {
+    deleted: Vec<DeleteJobResponse>,
+    failed: Vec<BatchJobActionError>,
+    deleted_bytes: u64,
+}
+
+struct JobArchiveArtifacts {
+    media_path: PathBuf,
+    info_json_path: PathBuf,
+    media_name: String,
+    info_json_name: String,
+}
+
+struct MetricSample {
+    name: &'static str,
+    kind: &'static str,
+    help: &'static str,
+    value: String,
+}
+
 #[derive(Debug, Serialize)]
 struct JobQueuePositionResponse {
     id: Uuid,
@@ -640,64 +730,88 @@ async fn runtime_config(State(state): State<AppState>) -> Json<RuntimeConfigResp
 
 fn runtime_config_response(config: &Config) -> RuntimeConfigResponse {
     RuntimeConfigResponse {
-        server: RuntimeServerConfig {
-            bind_addr: config.addr.to_string(),
-            cors_allowed_origins: config.cors_allowed_origins.clone(),
-            api_key_auth_enabled: !config.api_keys.is_empty(),
-            rate_limit_requests_per_minute: config.rate_limit_requests_per_minute,
-        },
-        queue: RuntimeQueueConfig {
-            queue_size: config.queue_size,
-            body_limit_bytes: config.body_limit_bytes,
-            request_timeout_seconds: config.request_timeout_seconds,
-        },
-        download: RuntimeDownloadConfig {
-            workers: config.workers,
-            output_dir: config.downloads_dir.display().to_string(),
-            yt_dlp_command: config.yt_dlp_command.clone(),
-            cookies_configured: config.cookies_path.is_some(),
-            cookie_profiles: config.cookie_profiles.keys().cloned().collect(),
-            format_configured: config.format.is_some(),
-            proxy_configured: config.proxy.is_some(),
-            enabled_platforms: config.download_enabled_platforms.clone(),
-            platform_policies: config
-                .platform_policies
-                .iter()
-                .map(|(platform, policy)| RuntimePlatformDownloadPolicy {
-                    platform: platform.clone(),
-                    cookies_configured: policy.cookies_path.is_some(),
-                    format_configured: policy.format.is_some(),
-                    proxy_configured: policy.proxy.is_some(),
-                    job_timeout_seconds: policy.job_timeout_seconds,
-                    max_attempts: policy.download_max_attempts,
-                    initial_backoff_ms: policy.download_initial_backoff_ms,
-                    max_concurrent: policy.max_concurrent,
-                })
-                .collect(),
-            max_urls_per_request: config.max_urls_per_request,
-            job_timeout_seconds: config.job_timeout_seconds,
-            max_attempts: config.download_max_attempts,
-            initial_backoff_ms: config.download_initial_backoff_ms,
-            max_storage_bytes: config.max_download_storage_bytes,
-            min_free_disk_bytes: config.min_free_disk_bytes,
-            post_processing_enabled: config.post_processing.enabled,
-            post_processing_command_count: config.post_processing.commands.len(),
-            object_storage_backend: config.object_storage.backend.as_str().to_string(),
-            object_storage_configured: config.object_storage.bucket.is_some(),
-            object_storage_public_urls: config.object_storage.public_base_url.is_some(),
-        },
-        webhooks: RuntimeWebhookConfig {
-            timeout_seconds: config.webhook_timeout_seconds,
-            connect_timeout_seconds: config.webhook_connect_timeout_seconds,
-            max_attempts: config.webhook_max_attempts,
-            initial_backoff_ms: config.webhook_initial_backoff_ms,
-            signing_enabled: config.webhook_signing_secret.is_some(),
-            allow_private_webhook_urls: config.allow_private_webhook_urls,
-        },
-        retention: RuntimeRetentionConfig {
-            job_retention_limit: config.job_retention_limit,
-            metadata_retention_limit: config.metadata_retention_limit,
-        },
+        server: runtime_server_config(config),
+        queue: runtime_queue_config(config),
+        download: runtime_download_config(config),
+        webhooks: runtime_webhook_config(config),
+        retention: runtime_retention_config(config),
+    }
+}
+
+fn runtime_server_config(config: &Config) -> RuntimeServerConfig {
+    RuntimeServerConfig {
+        bind_addr: config.addr.to_string(),
+        cors_allowed_origins: config.cors_allowed_origins.clone(),
+        api_key_auth_enabled: !config.api_keys.is_empty(),
+        rate_limit_requests_per_minute: config.rate_limit_requests_per_minute,
+    }
+}
+
+fn runtime_queue_config(config: &Config) -> RuntimeQueueConfig {
+    RuntimeQueueConfig {
+        queue_size: config.queue_size,
+        body_limit_bytes: config.body_limit_bytes,
+        request_timeout_seconds: config.request_timeout_seconds,
+    }
+}
+
+fn runtime_download_config(config: &Config) -> RuntimeDownloadConfig {
+    RuntimeDownloadConfig {
+        workers: config.workers,
+        output_dir: config.downloads_dir.display().to_string(),
+        yt_dlp_command: config.yt_dlp_command.clone(),
+        cookies_configured: config.cookies_path.is_some(),
+        cookie_profiles: config.cookie_profiles.keys().cloned().collect(),
+        format_configured: config.format.is_some(),
+        proxy_configured: config.proxy.is_some(),
+        enabled_platforms: config.download_enabled_platforms.clone(),
+        platform_policies: runtime_platform_policies(config),
+        max_urls_per_request: config.max_urls_per_request,
+        job_timeout_seconds: config.job_timeout_seconds,
+        max_attempts: config.download_max_attempts,
+        initial_backoff_ms: config.download_initial_backoff_ms,
+        max_storage_bytes: config.max_download_storage_bytes,
+        min_free_disk_bytes: config.min_free_disk_bytes,
+        post_processing_enabled: config.post_processing.enabled,
+        post_processing_command_count: config.post_processing.commands.len(),
+        object_storage_backend: config.object_storage.backend.as_str().to_string(),
+        object_storage_configured: config.object_storage.bucket.is_some(),
+        object_storage_public_urls: config.object_storage.public_base_url.is_some(),
+    }
+}
+
+fn runtime_platform_policies(config: &Config) -> Vec<RuntimePlatformDownloadPolicy> {
+    config
+        .platform_policies
+        .iter()
+        .map(|(platform, policy)| RuntimePlatformDownloadPolicy {
+            platform: platform.clone(),
+            cookies_configured: policy.cookies_path.is_some(),
+            format_configured: policy.format.is_some(),
+            proxy_configured: policy.proxy.is_some(),
+            job_timeout_seconds: policy.job_timeout_seconds,
+            max_attempts: policy.download_max_attempts,
+            initial_backoff_ms: policy.download_initial_backoff_ms,
+            max_concurrent: policy.max_concurrent,
+        })
+        .collect()
+}
+
+fn runtime_webhook_config(config: &Config) -> RuntimeWebhookConfig {
+    RuntimeWebhookConfig {
+        timeout_seconds: config.webhook_timeout_seconds,
+        connect_timeout_seconds: config.webhook_connect_timeout_seconds,
+        max_attempts: config.webhook_max_attempts,
+        initial_backoff_ms: config.webhook_initial_backoff_ms,
+        signing_enabled: config.webhook_signing_secret.is_some(),
+        allow_private_webhook_urls: config.allow_private_webhook_urls,
+    }
+}
+
+fn runtime_retention_config(config: &Config) -> RuntimeRetentionConfig {
+    RuntimeRetentionConfig {
+        job_retention_limit: config.job_retention_limit,
+        metadata_retention_limit: config.metadata_retention_limit,
     }
 }
 
@@ -880,25 +994,51 @@ async fn submit_download_jobs(
     let format = validate_download_format(format)?;
     let cookie_profile = validate_cookie_profile(&state.config, cookie_profile)?;
 
-    enum SubmitDecision {
-        Existing(QueueResponse),
-        Queue(String),
-    }
+    let decisions = submit_decisions(state, urls, &format, &cookie_profile, force).await;
+    ensure_queue_capacity(state, queued_decision_count(&decisions))?;
+    let jobs =
+        enqueue_submit_decisions(state, decisions, webhook_url, format, cookie_profile).await?;
 
+    Ok(BatchQueueResponse { jobs })
+}
+
+async fn submit_decisions(
+    state: &AppState,
+    urls: Vec<String>,
+    format: &Option<String>,
+    cookie_profile: &Option<String>,
+    force: bool,
+) -> Vec<SubmitDecision> {
     let mut decisions = Vec::with_capacity(urls.len());
-    let mut urls_to_queue = 0_usize;
     for url in urls {
-        if !force
-            && let Some(existing) =
-                reusable_successful_job(state, &url, &format, &cookie_profile).await
-        {
-            decisions.push(SubmitDecision::Existing(existing));
-            continue;
-        }
-        urls_to_queue += 1;
-        decisions.push(SubmitDecision::Queue(url));
+        decisions.push(submit_decision(state, url, format, cookie_profile, force).await);
     }
+    decisions
+}
 
+async fn submit_decision(
+    state: &AppState,
+    url: String,
+    format: &Option<String>,
+    cookie_profile: &Option<String>,
+    force: bool,
+) -> SubmitDecision {
+    if !force
+        && let Some(existing) = reusable_successful_job(state, &url, format, cookie_profile).await
+    {
+        return SubmitDecision::Existing(existing);
+    }
+    SubmitDecision::Queue(url)
+}
+
+fn queued_decision_count(decisions: &[SubmitDecision]) -> usize {
+    decisions
+        .iter()
+        .filter(|decision| matches!(decision, SubmitDecision::Queue(_)))
+        .count()
+}
+
+fn ensure_queue_capacity(state: &AppState, urls_to_queue: usize) -> Result<(), ApiError> {
     let available_slots = state.config.queue_size.saturating_sub(state.queue_tx.len());
     if urls_to_queue > available_slots {
         return Err(ApiError::ServiceUnavailable(format!(
@@ -906,7 +1046,16 @@ async fn submit_download_jobs(
             urls_to_queue, available_slots
         )));
     }
+    Ok(())
+}
 
+async fn enqueue_submit_decisions(
+    state: &AppState,
+    decisions: Vec<SubmitDecision>,
+    webhook_url: Option<String>,
+    format: Option<String>,
+    cookie_profile: Option<String>,
+) -> Result<Vec<QueueResponse>, ApiError> {
     let mut responses = Vec::with_capacity(decisions.len());
     for decision in decisions {
         match decision {
@@ -925,8 +1074,7 @@ async fn submit_download_jobs(
             }
         }
     }
-
-    Ok(BatchQueueResponse { jobs: responses })
+    Ok(responses)
 }
 
 async fn queue_url_job(
@@ -1681,26 +1829,14 @@ async fn serve_job_media(
     disposition: MediaDisposition,
     include_body: bool,
 ) -> Result<Response, ApiError> {
-    let record = {
-        let jobs = state.jobs.read().await;
-        jobs.get(&id).cloned().ok_or(ApiError::NotFound)?
-    };
-    let Some(result) = record.result else {
-        return Err(ApiError::Conflict(format!(
-            "job {id} has no downloaded media"
-        )));
-    };
+    let result = job_download_metadata(state, id, "media").await?;
     ensure_download_path(&state.config, &result.media_path)?;
     let mut media = open_download_artifact(&result.media_path).await?;
     let media_len = media_len(&media).await?;
     let range = parse_range_header(&headers, media_len)?;
-    let filename = result
-        .media_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("download.bin");
+    let filename = artifact_filename(&result.media_path, "download.bin");
     let content_type = content_type_for_path(&result.media_path);
-    let content_disposition = disposition.header_value(filename);
+    let content_disposition = disposition.header_value(&filename);
     let etag = artifact_etag(&result.media_path).await?;
     if if_none_match_matches(&headers, &etag) {
         return Ok(not_modified_response(etag));
@@ -1711,17 +1847,13 @@ async fn serve_job_media(
         } else {
             Body::empty()
         };
-        return Ok((
-            [
-                (header::CONTENT_TYPE, content_type),
-                (header::CONTENT_DISPOSITION, content_disposition),
-                (header::ACCEPT_RANGES, "bytes".to_string()),
-                (header::CONTENT_LENGTH, media_len.to_string()),
-                (header::ETAG, etag),
-            ],
+        return Ok(full_artifact_response(
+            content_type,
+            content_disposition,
+            media_len,
+            etag,
             body,
-        )
-            .into_response());
+        ));
     };
 
     let body = if include_body {
@@ -1733,19 +1865,78 @@ async fn serve_job_media(
     } else {
         Body::empty()
     };
-    Ok((
+    Ok(partial_artifact_response(
+        content_type,
+        content_disposition,
+        range,
+        media_len,
+        etag,
+        body,
+    ))
+}
+
+fn artifact_filename(path: &Path, fallback: &str) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn full_artifact_response(
+    content_type: String,
+    content_disposition: String,
+    content_len: u64,
+    etag: String,
+    body: Body,
+) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CONTENT_DISPOSITION, content_disposition),
+            (header::ACCEPT_RANGES, "bytes".to_string()),
+            (header::CONTENT_LENGTH, content_len.to_string()),
+            (header::ETAG, etag),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+fn partial_artifact_response(
+    content_type: String,
+    content_disposition: String,
+    range: ByteRange,
+    total_len: u64,
+    etag: String,
+    body: Body,
+) -> Response {
+    (
         StatusCode::PARTIAL_CONTENT,
         [
             (header::CONTENT_TYPE, content_type),
             (header::CONTENT_DISPOSITION, content_disposition),
             (header::ACCEPT_RANGES, "bytes".to_string()),
-            (header::CONTENT_RANGE, range.content_range(media_len)),
+            (header::CONTENT_RANGE, range.content_range(total_len)),
             (header::CONTENT_LENGTH, range.len().to_string()),
             (header::ETAG, etag),
         ],
         body,
     )
-        .into_response())
+        .into_response()
+}
+
+async fn job_download_metadata(
+    state: &AppState,
+    id: Uuid,
+    artifact_name: &'static str,
+) -> Result<DownloadMetadata, ApiError> {
+    let record = {
+        let jobs = state.jobs.read().await;
+        jobs.get(&id).cloned().ok_or(ApiError::NotFound)?
+    };
+    record
+        .result
+        .ok_or_else(|| ApiError::Conflict(format!("job {id} has no downloaded {artifact_name}")))
 }
 
 async fn get_job_info_json(
@@ -1852,107 +2043,100 @@ async fn serve_job_archive(
     headers: HeaderMap,
     include_body: bool,
 ) -> Result<Response, ApiError> {
-    let record = {
-        let jobs = state.jobs.read().await;
-        jobs.get(&id).cloned().ok_or(ApiError::NotFound)?
-    };
-    let Some(result) = record.result else {
-        return Err(ApiError::Conflict(format!(
-            "job {id} has no downloaded artifacts"
-        )));
-    };
-    ensure_download_path(&state.config, &result.media_path)?;
-    ensure_download_path(&state.config, &result.info_json_path)?;
-
-    let media_name = archive_entry_name(&result.media_path, "download.bin");
-    let info_json_name = archive_entry_name(&result.info_json_path, "info.json");
-    let archive_files = [
-        TarFileEntry {
-            name: &media_name,
-            path: &result.media_path,
-        },
-        TarFileEntry {
-            name: &info_json_name,
-            path: &result.info_json_path,
-        },
-    ];
+    let archive = job_archive_artifacts(state, id).await?;
+    let archive_files = archive.tar_files();
     let etag = archive_etag(&archive_files).await?;
     if if_none_match_matches(&headers, &etag) {
         return Ok(not_modified_response(etag));
     }
     let archive_len = tar_archive_file_len(&archive_files).await?;
     let range = parse_range_header(&headers, archive_len)?;
+    let content_type = "application/x-tar".to_string();
+    let content_disposition = format!("attachment; filename=\"{id}.tar\"");
 
     let Some(range) = range else {
-        let body = if include_body {
-            let media_bytes = read_download_artifact(&result.media_path).await?;
-            let info_json_bytes = read_download_artifact(&result.info_json_path).await?;
-            let archive = build_tar_archive(&[
-                TarEntry {
-                    name: &media_name,
-                    bytes: &media_bytes,
-                },
-                TarEntry {
-                    name: &info_json_name,
-                    bytes: &info_json_bytes,
-                },
-            ])
-            .map_err(ApiError::Internal)?;
-            Body::from(archive)
-        } else {
-            Body::empty()
-        };
-
-        return Ok((
-            [
-                (header::CONTENT_TYPE, "application/x-tar".to_string()),
-                (
-                    header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{id}.tar\""),
-                ),
-                (header::ACCEPT_RANGES, "bytes".to_string()),
-                (header::CONTENT_LENGTH, archive_len.to_string()),
-                (header::ETAG, etag),
-            ],
+        let body = archive.body(include_body).await?;
+        return Ok(full_artifact_response(
+            content_type,
+            content_disposition,
+            archive_len,
+            etag,
             body,
-        )
-            .into_response());
+        ));
     };
 
-    let body = if include_body {
-        let media_bytes = read_download_artifact(&result.media_path).await?;
-        let info_json_bytes = read_download_artifact(&result.info_json_path).await?;
-        let archive = build_tar_archive(&[
+    let body = archive.range_body(range, include_body).await?;
+    Ok(partial_artifact_response(
+        content_type,
+        content_disposition,
+        range,
+        archive_len,
+        etag,
+        body,
+    ))
+}
+
+async fn job_archive_artifacts(
+    state: &AppState,
+    id: Uuid,
+) -> Result<JobArchiveArtifacts, ApiError> {
+    let result = job_download_metadata(state, id, "artifacts").await?;
+    ensure_download_path(&state.config, &result.media_path)?;
+    ensure_download_path(&state.config, &result.info_json_path)?;
+    Ok(JobArchiveArtifacts {
+        media_name: archive_entry_name(&result.media_path, "download.bin"),
+        info_json_name: archive_entry_name(&result.info_json_path, "info.json"),
+        media_path: result.media_path,
+        info_json_path: result.info_json_path,
+    })
+}
+
+impl JobArchiveArtifacts {
+    fn tar_files(&self) -> [TarFileEntry<'_>; 2] {
+        [
+            TarFileEntry {
+                name: &self.media_name,
+                path: &self.media_path,
+            },
+            TarFileEntry {
+                name: &self.info_json_name,
+                path: &self.info_json_path,
+            },
+        ]
+    }
+
+    async fn body(&self, include_body: bool) -> Result<Body, ApiError> {
+        if !include_body {
+            return Ok(Body::empty());
+        }
+        self.build().await.map(Body::from)
+    }
+
+    async fn range_body(&self, range: ByteRange, include_body: bool) -> Result<Body, ApiError> {
+        if !include_body {
+            return Ok(Body::empty());
+        }
+        let archive = self.build().await?;
+        Ok(Body::from(
+            archive[range.start as usize..=range.end as usize].to_vec(),
+        ))
+    }
+
+    async fn build(&self) -> Result<Vec<u8>, ApiError> {
+        let media_bytes = read_download_artifact(&self.media_path).await?;
+        let info_json_bytes = read_download_artifact(&self.info_json_path).await?;
+        build_tar_archive(&[
             TarEntry {
-                name: &media_name,
+                name: &self.media_name,
                 bytes: &media_bytes,
             },
             TarEntry {
-                name: &info_json_name,
+                name: &self.info_json_name,
                 bytes: &info_json_bytes,
             },
         ])
-        .map_err(ApiError::Internal)?;
-        Body::from(archive[range.start as usize..=range.end as usize].to_vec())
-    } else {
-        Body::empty()
-    };
-    Ok((
-        StatusCode::PARTIAL_CONTENT,
-        [
-            (header::CONTENT_TYPE, "application/x-tar".to_string()),
-            (
-                header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{id}.tar\""),
-            ),
-            (header::ACCEPT_RANGES, "bytes".to_string()),
-            (header::CONTENT_RANGE, range.content_range(archive_len)),
-            (header::CONTENT_LENGTH, range.len().to_string()),
-            (header::ETAG, etag),
-        ],
-        body,
-    )
-        .into_response())
+        .map_err(ApiError::Internal)
+    }
 }
 
 async fn delete_job(
@@ -2046,18 +2230,47 @@ async fn storage_cleanup_response(
         .collect::<Vec<_>>();
 
     if dry_run {
-        return Ok(StorageCleanupResponse {
-            dry_run,
+        return Ok(storage_cleanup_dry_run_response(
             max_bytes,
             current_bytes,
             bytes_to_delete,
-            bytes_after: planned_bytes_after,
-            jobs_to_delete: candidate_responses,
-            deleted: Vec::new(),
-            failed: Vec::new(),
-        });
+            planned_bytes_after,
+            candidate_responses,
+        ));
     }
 
+    let execution = execute_storage_cleanup(state, jobs_to_delete).await;
+    Ok(storage_cleanup_run_response(
+        max_bytes,
+        current_bytes,
+        candidate_responses,
+        execution,
+    ))
+}
+
+fn storage_cleanup_dry_run_response(
+    max_bytes: Option<u64>,
+    current_bytes: u64,
+    bytes_to_delete: u64,
+    bytes_after: u64,
+    jobs_to_delete: Vec<StorageCleanupCandidateResponse>,
+) -> StorageCleanupResponse {
+    StorageCleanupResponse {
+        dry_run: true,
+        max_bytes,
+        current_bytes,
+        bytes_to_delete,
+        bytes_after,
+        jobs_to_delete,
+        deleted: Vec::new(),
+        failed: Vec::new(),
+    }
+}
+
+async fn execute_storage_cleanup(
+    state: &AppState,
+    jobs_to_delete: Vec<StorageCleanupCandidate>,
+) -> StorageCleanupExecution {
     let mut deleted = Vec::with_capacity(jobs_to_delete.len());
     let mut failed = Vec::with_capacity(jobs_to_delete.len());
     let mut deleted_bytes = 0_u64;
@@ -2077,17 +2290,29 @@ async fn storage_cleanup_response(
             }
         }
     }
-
-    Ok(StorageCleanupResponse {
-        dry_run,
-        max_bytes,
-        current_bytes,
-        bytes_to_delete: deleted_bytes,
-        bytes_after: current_bytes.saturating_sub(deleted_bytes),
-        jobs_to_delete: candidate_responses,
+    StorageCleanupExecution {
         deleted,
         failed,
-    })
+        deleted_bytes,
+    }
+}
+
+fn storage_cleanup_run_response(
+    max_bytes: Option<u64>,
+    current_bytes: u64,
+    jobs_to_delete: Vec<StorageCleanupCandidateResponse>,
+    execution: StorageCleanupExecution,
+) -> StorageCleanupResponse {
+    StorageCleanupResponse {
+        dry_run: false,
+        max_bytes,
+        current_bytes,
+        bytes_to_delete: execution.deleted_bytes,
+        bytes_after: current_bytes.saturating_sub(execution.deleted_bytes),
+        jobs_to_delete,
+        deleted: execution.deleted,
+        failed: execution.failed,
+    }
 }
 
 async fn storage_cleanup_plan(
@@ -2420,88 +2645,12 @@ fn validate_download_request(
     format: Option<String>,
     cookie_profile: Option<String>,
 ) -> ValidateDownloadsResponse {
-    let candidates = values
-        .iter()
-        .enumerate()
-        .filter_map(|(index, value)| {
-            let value = value.trim();
-            (!value.is_empty()).then_some((index, value))
-        })
-        .collect::<Vec<_>>();
-
-    let mut errors = Vec::new();
-    if candidates.is_empty() {
-        errors.push(ValidationErrorResponse {
-            field: "urls",
-            index: None,
-            value: None,
-            message: "at least one URL is required".to_string(),
-        });
-    }
-    if candidates.len() > config.max_urls_per_request {
-        errors.push(ValidationErrorResponse {
-            field: "urls",
-            index: None,
-            value: None,
-            message: format!(
-                "too many URLs: got {}, maximum is {}",
-                candidates.len(),
-                config.max_urls_per_request
-            ),
-        });
-    }
-
-    let mut seen = HashSet::new();
-    let mut urls = Vec::with_capacity(candidates.len().min(config.max_urls_per_request));
-    for (index, value) in candidates {
-        match validate_download_url(value, &config.download_enabled_platforms) {
-            Ok(url) if seen.insert(url.clone()) => urls.push(url),
-            Ok(_) => {}
-            Err(err) => errors.push(ValidationErrorResponse {
-                field: "urls",
-                index: Some(index),
-                value: Some(value.to_string()),
-                message: err.to_string(),
-            }),
-        }
-    }
-
-    let webhook_url = match validate_webhook_url(config, webhook_url) {
-        Ok(webhook_url) => webhook_url,
-        Err(err) => {
-            errors.push(ValidationErrorResponse {
-                field: "webhook_url",
-                index: None,
-                value: None,
-                message: err.to_string(),
-            });
-            None
-        }
-    };
-    let format = match validate_download_format(format) {
-        Ok(format) => format,
-        Err(err) => {
-            errors.push(ValidationErrorResponse {
-                field: "format",
-                index: None,
-                value: None,
-                message: err.to_string(),
-            });
-            None
-        }
-    };
-    let cookie_profile = match validate_cookie_profile(config, cookie_profile) {
-        Ok(cookie_profile) => cookie_profile,
-        Err(err) => {
-            errors.push(ValidationErrorResponse {
-                field: "cookie_profile",
-                index: None,
-                value: None,
-                message: err.to_string(),
-            });
-            None
-        }
-    };
+    let candidates = download_request_candidates(values);
+    let mut errors = download_request_url_count_errors(&candidates, config.max_urls_per_request);
+    let urls = validate_request_url_candidates(config, &candidates, &mut errors);
+    let webhook_url = validate_request_webhook_url(config, webhook_url, &mut errors);
+    let format = validate_request_format(format, &mut errors);
+    let cookie_profile = validate_request_cookie_profile(config, cookie_profile, &mut errors);
 
     ValidateDownloadsResponse {
         valid: errors.is_empty(),
@@ -2512,6 +2661,127 @@ fn validate_download_request(
         format,
         cookie_profile,
         errors,
+    }
+}
+
+fn download_request_candidates(values: &[String]) -> Vec<(usize, &str)> {
+    values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            let value = value.trim();
+            (!value.is_empty()).then_some((index, value))
+        })
+        .collect()
+}
+
+fn download_request_url_count_errors(
+    candidates: &[(usize, &str)],
+    max_urls: usize,
+) -> Vec<ValidationErrorResponse> {
+    let mut errors = Vec::new();
+    if candidates.is_empty() {
+        errors.push(validation_error(
+            "urls",
+            None,
+            None,
+            "at least one URL is required".to_string(),
+        ));
+    }
+    if candidates.len() > max_urls {
+        errors.push(validation_error(
+            "urls",
+            None,
+            None,
+            format!(
+                "too many URLs: got {}, maximum is {}",
+                candidates.len(),
+                max_urls
+            ),
+        ));
+    }
+    errors
+}
+
+fn validate_request_url_candidates(
+    config: &Config,
+    candidates: &[(usize, &str)],
+    errors: &mut Vec<ValidationErrorResponse>,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut urls = Vec::with_capacity(candidates.len().min(config.max_urls_per_request));
+    for &(index, value) in candidates {
+        match validate_download_url(value, &config.download_enabled_platforms) {
+            Ok(url) if seen.insert(url.clone()) => urls.push(url),
+            Ok(_) => {}
+            Err(err) => errors.push(validation_error(
+                "urls",
+                Some(index),
+                Some(value.to_string()),
+                err.to_string(),
+            )),
+        }
+    }
+    urls
+}
+
+fn validate_request_webhook_url(
+    config: &Config,
+    webhook_url: Option<String>,
+    errors: &mut Vec<ValidationErrorResponse>,
+) -> Option<String> {
+    match validate_webhook_url(config, webhook_url) {
+        Ok(webhook_url) => webhook_url,
+        Err(err) => {
+            errors.push(validation_error("webhook_url", None, None, err.to_string()));
+            None
+        }
+    }
+}
+
+fn validate_request_format(
+    format: Option<String>,
+    errors: &mut Vec<ValidationErrorResponse>,
+) -> Option<String> {
+    match validate_download_format(format) {
+        Ok(format) => format,
+        Err(err) => {
+            errors.push(validation_error("format", None, None, err.to_string()));
+            None
+        }
+    }
+}
+
+fn validate_request_cookie_profile(
+    config: &Config,
+    cookie_profile: Option<String>,
+    errors: &mut Vec<ValidationErrorResponse>,
+) -> Option<String> {
+    match validate_cookie_profile(config, cookie_profile) {
+        Ok(cookie_profile) => cookie_profile,
+        Err(err) => {
+            errors.push(validation_error(
+                "cookie_profile",
+                None,
+                None,
+                err.to_string(),
+            ));
+            None
+        }
+    }
+}
+
+fn validation_error(
+    field: &'static str,
+    index: Option<usize>,
+    value: Option<String>,
+    message: String,
+) -> ValidationErrorResponse {
+    ValidationErrorResponse {
+        field,
+        index,
+        value,
+        message,
     }
 }
 
@@ -2690,84 +2960,64 @@ fn export_jobs_jsonl(records: &[JobRecord]) -> Result<String, ApiError> {
 }
 
 fn export_jobs_csv(records: &[JobRecord]) -> String {
-    const HEADERS: &[&str] = &[
-        "id",
-        "status",
-        "created_at",
-        "updated_at",
-        "url",
-        "platform",
-        "webhook_url",
-        "format",
-        "cookie_profile",
-        "attempts",
-        "error_kind",
-        "error",
-        "extractor",
-        "title",
-        "uploader",
-        "duration",
-        "extension",
-        "media_path",
-        "media_bytes",
-        "info_json_path",
-        "yt_dlp_version",
-        "elapsed_ms",
-    ];
     let mut output = String::with_capacity(records.len().saturating_mul(512));
-    output.push_str(&csv_row(HEADERS.iter().copied()));
+    output.push_str(&csv_row(EXPORT_JOB_CSV_HEADERS.iter().copied()));
     output.push('\n');
     for record in records {
-        let result = record.result.as_ref();
-        let fields = [
-            record.id.to_string(),
-            record.status.to_string(),
-            record.created_at.to_string(),
-            record.updated_at.to_string(),
-            record.url.clone(),
-            job_platform(record).unwrap_or_default().to_string(),
-            record.webhook_url.clone().unwrap_or_default(),
-            record.format.clone().unwrap_or_default(),
-            record.cookie_profile.clone().unwrap_or_default(),
-            record.attempts.to_string(),
-            record.error_kind.clone().unwrap_or_default(),
-            record.error.clone().unwrap_or_default(),
-            result
-                .and_then(|result| result.extractor.clone())
-                .unwrap_or_default(),
-            result
-                .and_then(|result| result.title.clone())
-                .unwrap_or_default(),
-            result
-                .and_then(|result| result.uploader.clone())
-                .unwrap_or_default(),
-            result
-                .and_then(|result| result.duration)
-                .map(|duration| duration.to_string())
-                .unwrap_or_default(),
-            result
-                .and_then(|result| result.extension.clone())
-                .unwrap_or_default(),
-            result
-                .map(|result| result.media_path.display().to_string())
-                .unwrap_or_default(),
-            result
-                .map(|result| result.media_bytes.to_string())
-                .unwrap_or_default(),
-            result
-                .map(|result| result.info_json_path.display().to_string())
-                .unwrap_or_default(),
-            result
-                .map(|result| result.yt_dlp_version.clone())
-                .unwrap_or_default(),
-            result
-                .map(|result| result.elapsed_ms.to_string())
-                .unwrap_or_default(),
-        ];
+        let fields = export_job_csv_fields(record);
         output.push_str(&csv_row(fields.iter().map(String::as_str)));
         output.push('\n');
     }
     output
+}
+
+fn export_job_csv_fields(record: &JobRecord) -> [String; 22] {
+    let result = record.result.as_ref();
+    [
+        record.id.to_string(),
+        record.status.to_string(),
+        record.created_at.to_string(),
+        record.updated_at.to_string(),
+        record.url.clone(),
+        job_platform(record).unwrap_or_default().to_string(),
+        record.webhook_url.clone().unwrap_or_default(),
+        record.format.clone().unwrap_or_default(),
+        record.cookie_profile.clone().unwrap_or_default(),
+        record.attempts.to_string(),
+        record.error_kind.clone().unwrap_or_default(),
+        record.error.clone().unwrap_or_default(),
+        result
+            .and_then(|result| result.extractor.clone())
+            .unwrap_or_default(),
+        result
+            .and_then(|result| result.title.clone())
+            .unwrap_or_default(),
+        result
+            .and_then(|result| result.uploader.clone())
+            .unwrap_or_default(),
+        result
+            .and_then(|result| result.duration)
+            .map(|duration| duration.to_string())
+            .unwrap_or_default(),
+        result
+            .and_then(|result| result.extension.clone())
+            .unwrap_or_default(),
+        result
+            .map(|result| result.media_path.display().to_string())
+            .unwrap_or_default(),
+        result
+            .map(|result| result.media_bytes.to_string())
+            .unwrap_or_default(),
+        result
+            .map(|result| result.info_json_path.display().to_string())
+            .unwrap_or_default(),
+        result
+            .map(|result| result.yt_dlp_version.clone())
+            .unwrap_or_default(),
+        result
+            .map(|result| result.elapsed_ms.to_string())
+            .unwrap_or_default(),
+    ]
 }
 
 fn csv_row<'a>(fields: impl IntoIterator<Item = &'a str>) -> String {
@@ -3678,111 +3928,9 @@ fn job_result_view_for_job(
 
 fn prometheus_metrics(metrics: &MetricsResponse) -> String {
     let mut output = String::new();
-    push_metric(
-        &mut output,
-        "yt_dlp_server_workers_expected",
-        "gauge",
-        "Configured download worker count.",
-        metrics.workers.expected,
-    );
-    push_metric(
-        &mut output,
-        "yt_dlp_server_workers_ready",
-        "gauge",
-        "Download workers currently ready.",
-        metrics.workers.ready,
-    );
-    push_metric(
-        &mut output,
-        "yt_dlp_server_workers_failed",
-        "gauge",
-        "Download workers that stopped unexpectedly.",
-        metrics.workers.failed,
-    );
-    push_metric(
-        &mut output,
-        "yt_dlp_server_queue_depth",
-        "gauge",
-        "Jobs currently waiting in the in-process queue.",
-        metrics.queued,
-    );
-    push_metric(
-        &mut output,
-        "yt_dlp_server_http_requests_total",
-        "counter",
-        "HTTP requests handled by the server.",
-        metrics.http_requests_total,
-    );
-    push_metric(
-        &mut output,
-        "yt_dlp_server_http_requests_failed_total",
-        "counter",
-        "HTTP requests that returned 4xx or 5xx.",
-        metrics.http_requests_failed,
-    );
-    push_metric(
-        &mut output,
-        "yt_dlp_server_http_request_duration_ms_total",
-        "counter",
-        "Total HTTP request handling time in milliseconds.",
-        metrics.total_request_ms,
-    );
-    push_metric(
-        &mut output,
-        "yt_dlp_server_jobs_started_total",
-        "counter",
-        "Download jobs started by workers.",
-        metrics.jobs_started,
-    );
-    push_metric(
-        &mut output,
-        "yt_dlp_server_jobs_succeeded_total",
-        "counter",
-        "Download jobs that completed successfully.",
-        metrics.jobs_succeeded,
-    );
-    push_metric(
-        &mut output,
-        "yt_dlp_server_jobs_failed_total",
-        "counter",
-        "Download jobs that failed or were canceled.",
-        metrics.jobs_failed,
-    );
-    push_metric(
-        &mut output,
-        "yt_dlp_server_jobs_timed_out_total",
-        "counter",
-        "Download jobs that timed out.",
-        metrics.jobs_timed_out,
-    );
-    push_metric(
-        &mut output,
-        "yt_dlp_server_download_duration_ms_total",
-        "counter",
-        "Total download job runtime in milliseconds.",
-        metrics.total_download_ms,
-    );
-    push_metric(
-        &mut output,
-        "yt_dlp_server_webhook_failures_total",
-        "counter",
-        "Webhook delivery failures.",
-        metrics.webhook_failures,
-    );
-    push_metric(
-        &mut output,
-        "yt_dlp_server_cleanup_failures_total",
-        "counter",
-        "Download cleanup failures.",
-        metrics.cleanup_failures,
-    );
-    push_metric(
-        &mut output,
-        "yt_dlp_server_retained_jobs",
-        "gauge",
-        "Job records retained in memory.",
-        metrics.retained_jobs,
-    );
+    for sample in prometheus_metric_samples(metrics) {
+        push_metric_sample(&mut output, &sample);
+    }
     if let Some(rss) = metrics.process_memory_rss_bytes {
         push_metric(
             &mut output,
@@ -3793,6 +3941,149 @@ fn prometheus_metrics(metrics: &MetricsResponse) -> String {
         );
     }
     output
+}
+
+fn prometheus_metric_samples(metrics: &MetricsResponse) -> Vec<MetricSample> {
+    let mut samples = Vec::with_capacity(15);
+    samples.extend(worker_metric_samples(metrics));
+    samples.extend(http_metric_samples(metrics));
+    samples.extend(job_metric_samples(metrics));
+    samples.extend(operations_metric_samples(metrics));
+    samples
+}
+
+fn worker_metric_samples(metrics: &MetricsResponse) -> [MetricSample; 4] {
+    [
+        metric_sample(
+            "yt_dlp_server_workers_expected",
+            "gauge",
+            "Configured download worker count.",
+            metrics.workers.expected,
+        ),
+        metric_sample(
+            "yt_dlp_server_workers_ready",
+            "gauge",
+            "Download workers currently ready.",
+            metrics.workers.ready,
+        ),
+        metric_sample(
+            "yt_dlp_server_workers_failed",
+            "gauge",
+            "Download workers that stopped unexpectedly.",
+            metrics.workers.failed,
+        ),
+        metric_sample(
+            "yt_dlp_server_queue_depth",
+            "gauge",
+            "Jobs currently waiting in the in-process queue.",
+            metrics.queued,
+        ),
+    ]
+}
+
+fn http_metric_samples(metrics: &MetricsResponse) -> [MetricSample; 3] {
+    [
+        metric_sample(
+            "yt_dlp_server_http_requests_total",
+            "counter",
+            "HTTP requests handled by the server.",
+            metrics.http_requests_total,
+        ),
+        metric_sample(
+            "yt_dlp_server_http_requests_failed_total",
+            "counter",
+            "HTTP requests that returned 4xx or 5xx.",
+            metrics.http_requests_failed,
+        ),
+        metric_sample(
+            "yt_dlp_server_http_request_duration_ms_total",
+            "counter",
+            "Total HTTP request handling time in milliseconds.",
+            metrics.total_request_ms,
+        ),
+    ]
+}
+
+fn job_metric_samples(metrics: &MetricsResponse) -> [MetricSample; 5] {
+    [
+        metric_sample(
+            "yt_dlp_server_jobs_started_total",
+            "counter",
+            "Download jobs started by workers.",
+            metrics.jobs_started,
+        ),
+        metric_sample(
+            "yt_dlp_server_jobs_succeeded_total",
+            "counter",
+            "Download jobs that completed successfully.",
+            metrics.jobs_succeeded,
+        ),
+        metric_sample(
+            "yt_dlp_server_jobs_failed_total",
+            "counter",
+            "Download jobs that failed or were canceled.",
+            metrics.jobs_failed,
+        ),
+        metric_sample(
+            "yt_dlp_server_jobs_timed_out_total",
+            "counter",
+            "Download jobs that timed out.",
+            metrics.jobs_timed_out,
+        ),
+        metric_sample(
+            "yt_dlp_server_download_duration_ms_total",
+            "counter",
+            "Total download job runtime in milliseconds.",
+            metrics.total_download_ms,
+        ),
+    ]
+}
+
+fn operations_metric_samples(metrics: &MetricsResponse) -> [MetricSample; 3] {
+    [
+        metric_sample(
+            "yt_dlp_server_webhook_failures_total",
+            "counter",
+            "Webhook delivery failures.",
+            metrics.webhook_failures,
+        ),
+        metric_sample(
+            "yt_dlp_server_cleanup_failures_total",
+            "counter",
+            "Download cleanup failures.",
+            metrics.cleanup_failures,
+        ),
+        metric_sample(
+            "yt_dlp_server_retained_jobs",
+            "gauge",
+            "Job records retained in memory.",
+            metrics.retained_jobs,
+        ),
+    ]
+}
+
+fn metric_sample(
+    name: &'static str,
+    kind: &'static str,
+    help: &'static str,
+    value: impl std::fmt::Display,
+) -> MetricSample {
+    MetricSample {
+        name,
+        kind,
+        help,
+        value: value.to_string(),
+    }
+}
+
+fn push_metric_sample(output: &mut String, sample: &MetricSample) {
+    push_metric(
+        output,
+        sample.name,
+        sample.kind,
+        sample.help,
+        sample.value.as_str(),
+    );
 }
 
 fn push_metric<T: std::fmt::Display>(

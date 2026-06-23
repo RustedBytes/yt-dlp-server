@@ -39,6 +39,19 @@ pub struct DownloadError {
 
 pub type DownloadResult = Result<DownloadReport, DownloadError>;
 
+struct DownloadJob<'a> {
+    config: &'a Config,
+    id: Uuid,
+    url: &'a str,
+    format: Option<&'a str>,
+    cookie_profile: Option<&'a str>,
+    cancel_flag: Arc<AtomicBool>,
+    job_dir: PathBuf,
+    started: Instant,
+    yt_dlp_version: String,
+    policy: EffectiveDownloadPolicy,
+}
+
 pub async fn check_downloader(config: &Config) -> anyhow::Result<String> {
     yt_dlp_version(config).await
 }
@@ -51,134 +64,176 @@ pub async fn download_url(
     cookie_profile: Option<&str>,
     cancel_flag: Arc<AtomicBool>,
 ) -> DownloadResult {
-    let started = Instant::now();
-    let job_dir = config.downloads_dir.join(id.to_string());
-    if let Err(err) = prepare_download_dir(&job_dir).await {
-        return Err(download_error(err, 0, Vec::new()));
+    match DownloadJob::prepare(config, id, url, format, cookie_profile, cancel_flag).await {
+        Ok(job) => job.run().await,
+        Err(err) => Err(err),
     }
-    if let Err(err) = ensure_min_free_disk_space(config).await {
-        cleanup_partial_download(&job_dir).await;
-        return Err(download_error(err, 0, Vec::new()));
+}
+
+impl<'a> DownloadJob<'a> {
+    async fn prepare(
+        config: &'a Config,
+        id: Uuid,
+        url: &'a str,
+        format: Option<&'a str>,
+        cookie_profile: Option<&'a str>,
+        cancel_flag: Arc<AtomicBool>,
+    ) -> Result<Self, DownloadError> {
+        let job_dir = config.downloads_dir.join(id.to_string());
+        if let Err(err) = prepare_download_dir(&job_dir).await {
+            return Err(download_error(err, 0, Vec::new()));
+        }
+        if let Err(err) = ensure_min_free_disk_space(config).await {
+            cleanup_partial_download(&job_dir).await;
+            return Err(download_error(err, 0, Vec::new()));
+        }
+
+        Ok(Self {
+            config,
+            id,
+            url,
+            format,
+            cookie_profile,
+            cancel_flag,
+            job_dir,
+            started: Instant::now(),
+            yt_dlp_version: yt_dlp_version_or_unknown(config, id).await,
+            policy: config.effective_download_policy(url, cookie_profile),
+        })
     }
 
-    let version = yt_dlp_version(config).await.unwrap_or_else(|err| {
+    async fn run(self) -> DownloadResult {
+        let attempts = self.policy.download_max_attempts.max(1);
+        let mut last_error = None;
+        let mut attempt_errors = Vec::with_capacity(attempts);
+        for attempt in 1..=attempts {
+            let attempt_started = Instant::now();
+            match self.run_attempt(attempt).await {
+                Ok(metadata) => {
+                    return Ok(DownloadReport {
+                        metadata,
+                        attempts: attempt,
+                        attempt_errors,
+                    });
+                }
+                Err(err) => {
+                    let error = err.to_string();
+                    last_error = Some(anyhow!(error.clone()));
+                    let should_retry = handle_attempt_error(
+                        &self,
+                        attempt,
+                        attempts,
+                        error,
+                        attempt_started.elapsed().as_millis(),
+                        &mut attempt_errors,
+                    )
+                    .await?;
+                    if !should_retry {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Err(download_error(
+            last_error.unwrap_or_else(|| anyhow!("download failed without running an attempt")),
+            attempts,
+            attempt_errors,
+        ))
+    }
+
+    async fn run_attempt(&self, attempt: usize) -> anyhow::Result<DownloadMetadata> {
+        prepare_download_dir(&self.job_dir).await?;
+        if self.cancel_flag.load(Ordering::Relaxed) {
+            anyhow::bail!("job canceled before download attempt");
+        }
+        run_yt_dlp(self).await?;
+        finalize_download_metadata(self).await.with_context(|| {
+            format!(
+                "failed to finalize download metadata job_id={} attempt={attempt}",
+                self.id
+            )
+        })
+    }
+}
+
+async fn handle_attempt_error(
+    job: &DownloadJob<'_>,
+    attempt: usize,
+    attempts: usize,
+    error: String,
+    elapsed_ms: u128,
+    attempt_errors: &mut Vec<DownloadAttempt>,
+) -> Result<bool, DownloadError> {
+    cleanup_partial_download(&job.job_dir).await;
+    let retry_backoff = (attempt < attempts)
+        .then(|| retry_backoff(job.policy.download_initial_backoff_ms, attempt));
+    attempt_errors.push(DownloadAttempt {
+        attempt,
+        error: error.clone(),
+        elapsed_ms,
+        retry_backoff_ms: retry_backoff.map(|delay| delay.as_millis()),
+    });
+    let Some(delay) = retry_backoff else {
+        return Ok(false);
+    };
+    warn!(
+        "download attempt failed job_id={} attempt={} max_attempts={} retry_backoff_ms={} error={}",
+        job.id,
+        attempt,
+        attempts,
+        delay.as_millis(),
+        error
+    );
+    if !delay.is_zero() && sleep_or_cancel(delay, &job.cancel_flag).await {
+        return Err(download_error(
+            anyhow!("job canceled during retry backoff"),
+            attempt,
+            std::mem::take(attempt_errors),
+        ));
+    }
+    Ok(true)
+}
+
+async fn yt_dlp_version_or_unknown(config: &Config, id: Uuid) -> String {
+    yt_dlp_version(config).await.unwrap_or_else(|err| {
         warn!(
             "failed to read yt-dlp version before download job_id={} error={}",
             id, err
         );
         "unknown".to_string()
-    });
-
-    let policy = config.effective_download_policy(url, cookie_profile);
-    let attempts = policy.download_max_attempts.max(1);
-    let mut last_error = None;
-    let mut attempt_errors = Vec::with_capacity(attempts);
-    for attempt in 1..=attempts {
-        if let Err(err) = prepare_download_dir(&job_dir).await {
-            return Err(download_error(err, attempt - 1, attempt_errors));
-        }
-        let attempt_started = Instant::now();
-        if cancel_flag.load(Ordering::Relaxed) {
-            return Err(download_error(
-                anyhow!("job canceled before download attempt"),
-                attempt - 1,
-                attempt_errors,
-            ));
-        }
-        let outcome = match run_yt_dlp(
-            config,
-            id,
-            &job_dir,
-            url,
-            format,
-            cookie_profile,
-            Arc::clone(&cancel_flag),
-        )
-        .await
-        {
-            Ok(()) => {
-                finalize_download_metadata(
-                    config,
-                    id,
-                    &job_dir,
-                    url,
-                    version.clone(),
-                    started.elapsed().as_millis(),
-                    Arc::clone(&cancel_flag),
-                )
-                .await
-            }
-            Err(err) => Err(err),
-        };
-
-        match outcome {
-            Ok(metadata) => {
-                return Ok(DownloadReport {
-                    metadata,
-                    attempts: attempt,
-                    attempt_errors,
-                });
-            }
-            Err(err) => {
-                cleanup_partial_download(&job_dir).await;
-                let error = err.to_string();
-                last_error = Some(err);
-                let retry_backoff = (attempt < attempts)
-                    .then(|| retry_backoff(policy.download_initial_backoff_ms, attempt));
-                attempt_errors.push(DownloadAttempt {
-                    attempt,
-                    error: error.clone(),
-                    elapsed_ms: attempt_started.elapsed().as_millis(),
-                    retry_backoff_ms: retry_backoff.map(|delay| delay.as_millis()),
-                });
-                let Some(delay) = retry_backoff else {
-                    break;
-                };
-                warn!(
-                    "download attempt failed job_id={} attempt={} max_attempts={} retry_backoff_ms={} error={}",
-                    id,
-                    attempt,
-                    attempts,
-                    delay.as_millis(),
-                    error
-                );
-                if !delay.is_zero() && sleep_or_cancel(delay, &cancel_flag).await {
-                    return Err(download_error(
-                        anyhow!("job canceled during retry backoff"),
-                        attempt,
-                        attempt_errors,
-                    ));
-                }
-            }
-        }
-    }
-
-    Err(download_error(
-        last_error.unwrap_or_else(|| anyhow!("download failed without running an attempt")),
-        attempts,
-        attempt_errors,
-    ))
+    })
 }
 
-async fn finalize_download_metadata(
-    config: &Config,
-    id: Uuid,
-    job_dir: &Path,
-    url: &str,
-    yt_dlp_version: String,
-    elapsed_ms: u128,
-    cancel_flag: Arc<AtomicBool>,
-) -> anyhow::Result<DownloadMetadata> {
-    let mut metadata =
-        metadata_from_download_dir(job_dir, url, yt_dlp_version.clone(), elapsed_ms).await?;
-    metadata.post_processing =
-        run_post_processing(config, id, job_dir, &metadata, Arc::clone(&cancel_flag)).await?;
+async fn finalize_download_metadata(job: &DownloadJob<'_>) -> anyhow::Result<DownloadMetadata> {
+    let elapsed_ms = job.started.elapsed().as_millis();
+    let mut metadata = metadata_from_download_dir(
+        &job.job_dir,
+        job.url,
+        job.yt_dlp_version.clone(),
+        elapsed_ms,
+    )
+    .await?;
+    metadata.post_processing = run_post_processing(
+        job.config,
+        job.id,
+        &job.job_dir,
+        &metadata,
+        Arc::clone(&job.cancel_flag),
+    )
+    .await?;
     if !metadata.post_processing.is_empty() {
         let post_processing = metadata.post_processing;
-        metadata = metadata_from_download_dir(job_dir, url, yt_dlp_version, elapsed_ms).await?;
+        metadata = metadata_from_download_dir(
+            &job.job_dir,
+            job.url,
+            job.yt_dlp_version.clone(),
+            elapsed_ms,
+        )
+        .await?;
         metadata.post_processing = post_processing;
     }
-    metadata.storage = store_download_artifacts(config, id, &metadata).await?;
+    metadata.storage = store_download_artifacts(job.config, job.id, &metadata).await?;
     Ok(metadata)
 }
 
@@ -286,21 +341,19 @@ pub fn version_command_args(config: &Config) -> Vec<OsString> {
     args
 }
 
-async fn run_yt_dlp(
-    config: &Config,
-    id: Uuid,
-    job_dir: &Path,
-    url: &str,
-    format: Option<&str>,
-    cookie_profile: Option<&str>,
-    cancel_flag: Arc<AtomicBool>,
-) -> anyhow::Result<()> {
-    let policy = config.effective_download_policy(url, cookie_profile);
+async fn run_yt_dlp(job: &DownloadJob<'_>) -> anyhow::Result<()> {
     let output = run_command_with_timeout(
-        &config.yt_dlp_command,
-        download_command_args(config, id, job_dir, url, format, cookie_profile),
-        policy.job_timeout_seconds,
-        cancel_flag,
+        &job.config.yt_dlp_command,
+        download_command_args(
+            job.config,
+            job.id,
+            &job.job_dir,
+            job.url,
+            job.format,
+            job.cookie_profile,
+        ),
+        job.policy.job_timeout_seconds,
+        Arc::clone(&job.cancel_flag),
     )
     .await?;
 
@@ -314,7 +367,7 @@ async fn run_yt_dlp(
 
     debug!(
         "yt-dlp download finished url={} stdout_bytes={} stderr_bytes={}",
-        url,
+        job.url,
         output.stdout.len(),
         output.stderr.len()
     );

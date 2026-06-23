@@ -652,30 +652,7 @@ fn object_storage_setting(
     let public_base_url =
         secret_setting("OBJECT_STORAGE_PUBLIC_BASE_URL", file_value.public_base_url);
 
-    if backend == ObjectStorageBackend::S3 {
-        if endpoint_url.is_none() {
-            return Err(anyhow!(
-                "OBJECT_STORAGE_ENDPOINT_URL is required when storage.backend is s3"
-            ));
-        }
-        if bucket.is_none() {
-            return Err(anyhow!(
-                "OBJECT_STORAGE_BUCKET is required when storage.backend is s3"
-            ));
-        }
-        if access_key_id.is_none() {
-            return Err(anyhow!(
-                "OBJECT_STORAGE_ACCESS_KEY_ID is required when storage.backend is s3"
-            ));
-        }
-        if secret_access_key.is_none() {
-            return Err(anyhow!(
-                "OBJECT_STORAGE_SECRET_ACCESS_KEY is required when storage.backend is s3"
-            ));
-        }
-    }
-
-    Ok(ObjectStorageConfig {
+    let config = ObjectStorageConfig {
         backend,
         endpoint_url,
         bucket,
@@ -686,7 +663,33 @@ fn object_storage_setting(
         prefix: normalize_object_prefix(&prefix),
         force_path_style,
         public_base_url,
-    })
+    };
+    validate_object_storage_config(&config)?;
+    Ok(config)
+}
+
+fn validate_object_storage_config(config: &ObjectStorageConfig) -> anyhow::Result<()> {
+    if config.backend != ObjectStorageBackend::S3 {
+        return Ok(());
+    }
+
+    for (name, value) in [
+        ("OBJECT_STORAGE_ENDPOINT_URL", config.endpoint_url.as_ref()),
+        ("OBJECT_STORAGE_BUCKET", config.bucket.as_ref()),
+        (
+            "OBJECT_STORAGE_ACCESS_KEY_ID",
+            config.access_key_id.as_ref(),
+        ),
+        (
+            "OBJECT_STORAGE_SECRET_ACCESS_KEY",
+            config.secret_access_key.as_ref(),
+        ),
+    ] {
+        if value.is_none() {
+            return Err(anyhow!("{name} is required when storage.backend is s3"));
+        }
+    }
+    Ok(())
 }
 
 fn object_storage_backend(value: &str) -> anyhow::Result<ObjectStorageBackend> {

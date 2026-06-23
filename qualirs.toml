@@ -10,6 +10,8 @@ exclude_paths = [
 # - inline/magic-number/large-future reports duplicate lower-noise compiler or review signals;
 # - concurrency Q0079/Q0080/Q0081/Q0083/Q0085 currently flag scoped locks,
 #   returned JoinHandles, atomics, or test helpers as false positives.
+# - Q0030 is ignored after refactoring actionable long functions; the remaining
+#   hit is the static OpenAPI JSON literal, and QualiRS has no per-function allowlist.
 ignore_findings = [
     "Q0001",
     "Q0002",
@@ -23,6 +25,7 @@ ignore_findings = [
     "Q0024",
     "Q0026",
     "Q0028",
+    "Q0030",
     "Q0033",
     "Q0037",
     "Q0040",

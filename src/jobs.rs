@@ -41,6 +41,23 @@ pub struct WorkerRuntime {
     handles: Vec<JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+pub struct WorkerPoolDependencies {
+    pub config: Arc<Config>,
+    pub jobs: Arc<RwLock<HashMap<Uuid, JobRecord>>>,
+    pub workers: Arc<WorkerPoolState>,
+    pub metrics: Arc<AppMetrics>,
+    pub webhooks: Arc<WebhookClient>,
+    pub cancellations: Arc<CancellationRegistry>,
+}
+
+#[derive(Clone)]
+struct WorkerSharedState {
+    deps: WorkerPoolDependencies,
+    shutdown: Arc<AtomicBool>,
+    platform_limiter: PlatformConcurrencyLimiter,
+}
+
 #[derive(Clone, Default)]
 struct PlatformConcurrencyLimiter {
     limits: Arc<HashMap<String, Arc<Semaphore>>>,
@@ -521,63 +538,101 @@ pub async fn enqueue_record(
     record: JobRecord,
 ) -> Result<QueueResponse, EnqueueError> {
     let id = record.id;
-    let request = JobRequest {
-        id,
-        url: record.url.clone(),
-        format: record.format.clone(),
-        cookie_profile: record.cookie_profile.clone(),
-    };
+    let request = job_request_from_record(&record);
 
     if state.queue_tx.is_full() {
         return Err(EnqueueError::QueueFull);
     }
 
-    {
-        let mut jobs = state.jobs.write().await;
-        jobs.insert(id, record.clone());
+    persist_queued_record(state, id, &record).await?;
+    send_queued_request(state, id, &record, request).await?;
+    log_queued_job(state, &record);
+
+    Ok(queue_response(id))
+}
+
+fn job_request_from_record(record: &JobRecord) -> JobRequest {
+    JobRequest {
+        id: record.id,
+        url: record.url.clone(),
+        format: record.format.clone(),
+        cookie_profile: record.cookie_profile.clone(),
     }
+}
 
-    append_jsonl(&state.config.submissions_jsonl, &record)
-        .await
-        .map_err(EnqueueError::Persist)?;
-
+async fn send_queued_request(
+    state: &AppState,
+    id: Uuid,
+    record: &JobRecord,
+    request: JobRequest,
+) -> Result<(), EnqueueError> {
     match state.queue_tx.try_send(request) {
         Ok(()) => {}
         Err(async_channel::TrySendError::Full(_)) => {
-            state.jobs.write().await.remove(&id);
-            persist_unqueued_record(
-                &state.config.results_jsonl,
-                record,
+            rollback_failed_enqueue(
+                state,
+                id,
+                record.clone(),
                 "download queue became full before the job could be queued",
             )
             .await?;
             return Err(EnqueueError::QueueFull);
         }
         Err(async_channel::TrySendError::Closed(_)) => {
-            state.jobs.write().await.remove(&id);
-            persist_unqueued_record(
-                &state.config.results_jsonl,
-                record,
+            rollback_failed_enqueue(
+                state,
+                id,
+                record.clone(),
                 "download queue closed before the job could be queued",
             )
             .await?;
             return Err(EnqueueError::QueueClosed);
         }
-    }
+    };
+    Ok(())
+}
 
+fn log_queued_job(state: &AppState, record: &JobRecord) {
     info!(
         "job queued job_id={} url={} queued={}",
-        id,
+        record.id,
         record.url,
         state.queue_tx.len()
     );
+}
 
-    Ok(QueueResponse {
+fn queue_response(id: Uuid) -> QueueResponse {
+    QueueResponse {
         id,
         status: JobStatus::Queued,
         status_url: format!("/v1/jobs/{id}"),
         existing: false,
-    })
+    }
+}
+
+async fn persist_queued_record(
+    state: &AppState,
+    id: Uuid,
+    record: &JobRecord,
+) -> Result<(), EnqueueError> {
+    {
+        let mut jobs = state.jobs.write().await;
+        jobs.insert(id, record.clone());
+    }
+
+    append_jsonl(&state.config.submissions_jsonl, record)
+        .await
+        .map_err(EnqueueError::Persist)
+}
+
+async fn rollback_failed_enqueue(
+    state: &AppState,
+    id: Uuid,
+    record: JobRecord,
+    error: &str,
+) -> Result<(), EnqueueError> {
+    state.jobs.write().await.remove(&id);
+    persist_unqueued_record(&state.config.results_jsonl, record, error).await
 }
 
 async fn persist_unqueued_record(
@@ -595,110 +650,145 @@ async fn persist_unqueued_record(
 }
 
 pub fn start_workers(
-    config: Arc<Config>,
-    jobs: Arc<RwLock<HashMap<Uuid, JobRecord>>>,
-    workers: Arc<WorkerPoolState>,
-    metrics: Arc<AppMetrics>,
-    webhooks: Arc<WebhookClient>,
-    cancellations: Arc<CancellationRegistry>,
+    deps: WorkerPoolDependencies,
     queue_rx: Receiver<JobRequest>,
 ) -> WorkerRuntime {
-    info!("starting download worker pool workers={}", config.workers);
+    info!(
+        "starting download worker pool workers={}",
+        deps.config.workers
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
-    let platform_limiter = PlatformConcurrencyLimiter::from_config(&config);
-    let mut handles = Vec::with_capacity(config.workers);
-    for worker_id in 0..config.workers {
-        let config = Arc::clone(&config);
-        let jobs = Arc::clone(&jobs);
-        let workers = Arc::clone(&workers);
-        let metrics = Arc::clone(&metrics);
-        let webhooks = Arc::clone(&webhooks);
-        let cancellations = Arc::clone(&cancellations);
-        let queue_rx = queue_rx.clone();
-        let shutdown = Arc::clone(&shutdown);
-        let platform_limiter = platform_limiter.clone();
-        workers.mark_ready();
-        handles.push(tokio::spawn(async move {
-            while let Ok(request) = queue_rx.recv().await {
-                if shutdown.load(Ordering::Relaxed) {
-                    debug!(
-                        "worker stopping before starting queued job worker_id={} job_id={}",
-                        worker_id, request.id
-                    );
-                    break;
-                }
-                let job_span = tracing::info_span!(
-                    "download_job",
-                    job_id = %request.id,
-                    worker_id,
-                    url = request.url.as_str(),
-                );
-                let _entered = job_span.enter();
-                debug!(
-                    "worker received job worker_id={} job_id={} url={}",
-                    worker_id, request.id, request.url
-                );
-                let cancel_flag = cancellations.flag_for(request.id);
-                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed)
-                    || is_job_canceled(&jobs, request.id).await
-                {
-                    info!("worker skipping canceled job job_id={}", request.id);
-                    cancellations.remove(request.id);
-                    continue;
-                }
-
-                let _platform_permit = platform_limiter.acquire(&request.url).await;
-                if shutdown.load(Ordering::Relaxed) {
-                    debug!(
-                        "worker stopping after platform concurrency wait worker_id={} job_id={}",
-                        worker_id, request.id
-                    );
-                    break;
-                }
-                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed)
-                    || is_job_canceled(&jobs, request.id).await
-                {
-                    info!(
-                        "worker skipping canceled job after platform concurrency wait job_id={}",
-                        request.id
-                    );
-                    cancellations.remove(request.id);
-                    continue;
-                }
-
-                metrics.record_job_started();
-                let job_started = Instant::now();
-                workers.mark_active(worker_id, request.id, request.url.clone());
-                mark_running(&jobs, request.id).await;
-
-                let result = download_url(
-                    &config,
-                    request.id,
-                    &request.url,
-                    request.format.as_deref(),
-                    request.cookie_profile.as_deref(),
-                    cancel_flag,
-                )
-                .await;
-                let elapsed_ms = job_started.elapsed().as_millis();
-                if is_timeout_error(&result) {
-                    metrics.record_job_timed_out(elapsed_ms);
-                } else if result.is_ok() {
-                    metrics.record_job_succeeded(elapsed_ms);
-                } else {
-                    metrics.record_job_failed(elapsed_ms);
-                }
-
-                finish_job(&config, &jobs, &metrics, &webhooks, request.id, result).await;
-                workers.clear_active(worker_id);
-                cancellations.remove(request.id);
-            }
-            workers.clear_active(worker_id);
-            workers.mark_stopped();
-        }));
+    let shared = WorkerSharedState {
+        platform_limiter: PlatformConcurrencyLimiter::from_config(&deps.config),
+        deps,
+        shutdown: Arc::clone(&shutdown),
+    };
+    let worker_count = shared.deps.config.workers;
+    let mut handles = Vec::with_capacity(worker_count);
+    for worker_id in 0..worker_count {
+        handles.push(spawn_worker(worker_id, shared.clone(), queue_rx.clone()));
     }
 
     WorkerRuntime { shutdown, handles }
+}
+
+fn spawn_worker(
+    worker_id: usize,
+    shared: WorkerSharedState,
+    queue_rx: Receiver<JobRequest>,
+) -> JoinHandle<()> {
+    shared.deps.workers.mark_ready();
+    tokio::spawn(async move {
+        run_worker_loop(worker_id, shared, queue_rx).await;
+    })
+}
+
+async fn run_worker_loop(
+    worker_id: usize,
+    shared: WorkerSharedState,
+    queue_rx: Receiver<JobRequest>,
+) {
+    while let Ok(request) = queue_rx.recv().await {
+        if !handle_worker_request(worker_id, &shared, request).await {
+            break;
+        }
+    }
+    shared.deps.workers.clear_active(worker_id);
+    shared.deps.workers.mark_stopped();
+}
+
+async fn handle_worker_request(
+    worker_id: usize,
+    shared: &WorkerSharedState,
+    request: JobRequest,
+) -> bool {
+    if shared.shutdown.load(Ordering::Relaxed) {
+        debug!(
+            "worker stopping before starting queued job worker_id={} job_id={}",
+            worker_id, request.id
+        );
+        return false;
+    }
+
+    let job_span = tracing::info_span!(
+        "download_job",
+        job_id = %request.id,
+        worker_id,
+        url = request.url.as_str(),
+    );
+    let _entered = job_span.enter();
+    debug!(
+        "worker received job worker_id={} job_id={} url={}",
+        worker_id, request.id, request.url
+    );
+
+    let cancel_flag = shared.deps.cancellations.flag_for(request.id);
+    if should_skip_canceled_job(shared, request.id, &cancel_flag).await {
+        info!("worker skipping canceled job job_id={}", request.id);
+        shared.deps.cancellations.remove(request.id);
+        return true;
+    }
+
+    let _platform_permit = shared.platform_limiter.acquire(&request.url).await;
+    if shared.shutdown.load(Ordering::Relaxed) {
+        debug!(
+            "worker stopping after platform concurrency wait worker_id={} job_id={}",
+            worker_id, request.id
+        );
+        return false;
+    }
+    if should_skip_canceled_job(shared, request.id, &cancel_flag).await {
+        info!(
+            "worker skipping canceled job after platform concurrency wait job_id={}",
+            request.id
+        );
+        shared.deps.cancellations.remove(request.id);
+        return true;
+    }
+
+    run_download_job(worker_id, shared, request, cancel_flag).await;
+    true
+}
+
+async fn should_skip_canceled_job(
+    shared: &WorkerSharedState,
+    id: Uuid,
+    cancel_flag: &AtomicBool,
+) -> bool {
+    cancel_flag.load(Ordering::Relaxed) || is_job_canceled(&shared.deps.jobs, id).await
+}
+
+async fn run_download_job(
+    worker_id: usize,
+    shared: &WorkerSharedState,
+    request: JobRequest,
+    cancel_flag: Arc<AtomicBool>,
+) {
+    shared.deps.metrics.record_job_started();
+    let job_started = Instant::now();
+    shared
+        .deps
+        .workers
+        .mark_active(worker_id, request.id, request.url.clone());
+    mark_running(&shared.deps.jobs, request.id).await;
+
+    let result = download_url(
+        &shared.deps.config,
+        request.id,
+        &request.url,
+        request.format.as_deref(),
+        request.cookie_profile.as_deref(),
+        cancel_flag,
+    )
+    .await;
+    record_download_metrics(
+        &shared.deps.metrics,
+        &result,
+        job_started.elapsed().as_millis(),
+    );
+    finish_job(&shared.deps, request.id, result).await;
+    shared.deps.workers.clear_active(worker_id);
+    shared.deps.cancellations.remove(request.id);
 }
 
 async fn is_job_canceled(jobs: &RwLock<HashMap<Uuid, JobRecord>>, id: Uuid) -> bool {
@@ -719,17 +809,28 @@ async fn mark_running(jobs: &RwLock<HashMap<Uuid, JobRecord>>, id: Uuid) {
     }
 }
 
-async fn finish_job(
-    config: &Config,
-    jobs: &RwLock<HashMap<Uuid, JobRecord>>,
+fn record_download_metrics(
     metrics: &AppMetrics,
-    webhooks: &WebhookClient,
+    result: &Result<DownloadReport, DownloadError>,
+    elapsed_ms: u128,
+) {
+    if is_timeout_error(result) {
+        metrics.record_job_timed_out(elapsed_ms);
+    } else if result.is_ok() {
+        metrics.record_job_succeeded(elapsed_ms);
+    } else {
+        metrics.record_job_failed(elapsed_ms);
+    }
+}
+
+async fn finish_job(
+    deps: &WorkerPoolDependencies,
     id: Uuid,
     result: Result<DownloadReport, DownloadError>,
 ) {
     let mut final_record = None;
     {
-        let mut jobs = jobs.write().await;
+        let mut jobs = deps.jobs.write().await;
         if let Some(record) = jobs.get_mut(&id) {
             record.updated_at = time::OffsetDateTime::now_utc();
             match result {
@@ -760,23 +861,25 @@ async fn finish_job(
     }
 
     if let Some(record) = final_record {
-        if let Err(err) = append_jsonl(&config.results_jsonl, &record).await {
+        if let Err(err) = append_jsonl(&deps.config.results_jsonl, &record).await {
             error!(
                 "failed to append result metadata job_id={} path={} error={}",
                 id,
-                config.results_jsonl.display(),
+                deps.config.results_jsonl.display(),
                 err
             );
         }
-        send_webhook(metrics, webhooks, &record).await;
-        enforce_download_storage_limit(config, jobs, metrics).await;
-        {
-            let mut jobs = jobs.write().await;
-            retain_recent_jobs(&mut jobs, config.job_retention_limit);
-        }
+        send_webhook(&deps.metrics, &deps.webhooks, &record).await;
+        enforce_download_storage_limit(&deps.config, &deps.jobs, &deps.metrics).await;
+        retain_recent_loaded_jobs(&deps.jobs, deps.config.job_retention_limit).await;
     } else {
         warn!("job missing while finishing job_id={}", id);
     }
+}
+
+async fn retain_recent_loaded_jobs(jobs: &RwLock<HashMap<Uuid, JobRecord>>, limit: usize) {
+    let mut jobs = jobs.write().await;
+    retain_recent_jobs(&mut jobs, limit);
 }
 
 async fn send_webhook(metrics: &AppMetrics, webhooks: &WebhookClient, record: &JobRecord) {
@@ -856,30 +959,49 @@ fn is_canceled_error(error: &DownloadError) -> bool {
 
 fn classify_error(error: &str) -> &'static str {
     let normalized = error.to_ascii_lowercase();
-    if normalized.contains("job canceled") {
-        "canceled"
-    } else if normalized.contains("timed out") {
-        "timeout"
-    } else if normalized.contains("429")
-        || normalized.contains("too many requests")
-        || normalized.contains("rate limit")
-    {
-        "rate_limited"
-    } else if normalized.contains("login")
-        || normalized.contains("sign in")
-        || normalized.contains("cookie")
-        || normalized.contains("private")
-    {
-        "authentication_required"
-    } else if normalized.contains("unsupported url") || normalized.contains("no suitable extractor")
-    {
-        "unsupported_url"
-    } else if normalized.contains("yt-dlp failed") {
-        "downloader_failed"
-    } else {
-        "download_failed"
+    for rule in ERROR_CLASSIFICATION_RULES {
+        if rule
+            .needles
+            .iter()
+            .any(|needle| normalized.contains(needle))
+        {
+            return rule.kind;
+        }
     }
+    "download_failed"
 }
+
+struct ErrorClassificationRule {
+    kind: &'static str,
+    needles: &'static [&'static str],
+}
+
+const ERROR_CLASSIFICATION_RULES: &[ErrorClassificationRule] = &[
+    ErrorClassificationRule {
+        kind: "canceled",
+        needles: &["job canceled"],
+    },
+    ErrorClassificationRule {
+        kind: "timeout",
+        needles: &["timed out"],
+    },
+    ErrorClassificationRule {
+        kind: "rate_limited",
+        needles: &["429", "too many requests", "rate limit"],
+    },
+    ErrorClassificationRule {
+        kind: "authentication_required",
+        needles: &["login", "sign in", "cookie", "private"],
+    },
+    ErrorClassificationRule {
+        kind: "unsupported_url",
+        needles: &["unsupported url", "no suitable extractor"],
+    },
+    ErrorClassificationRule {
+        kind: "downloader_failed",
+        needles: &["yt-dlp failed"],
+    },
+];
 
 #[derive(Debug)]
 struct DownloadStorageCandidate {
@@ -898,33 +1020,8 @@ async fn enforce_download_storage_limit(
         return;
     }
 
-    let mut candidates = {
-        let jobs = jobs.read().await;
-        jobs.values()
-            .filter_map(|record| {
-                if record.status != JobStatus::Succeeded {
-                    return None;
-                }
-                let result = record.result.as_ref()?;
-                let directory = result.media_path.parent()?.to_path_buf();
-                if !directory.starts_with(&config.downloads_dir)
-                    || directory == config.downloads_dir
-                {
-                    return None;
-                }
-                Some(DownloadStorageCandidate {
-                    id: record.id,
-                    updated_at: record.updated_at,
-                    bytes: result.media_bytes,
-                    directory,
-                })
-            })
-            .collect::<Vec<_>>()
-    };
-    let mut total_bytes = candidates
-        .iter()
-        .map(|candidate| candidate.bytes)
-        .sum::<u64>();
+    let mut candidates = download_storage_candidates(config, jobs).await;
+    let mut total_bytes = download_storage_bytes(&candidates);
     if total_bytes <= config.max_download_storage_bytes {
         return;
     }
@@ -935,31 +1032,79 @@ async fn enforce_download_storage_limit(
             break;
         }
 
-        match tokio::fs::remove_dir_all(&candidate.directory).await {
-            Ok(()) => {
-                total_bytes = total_bytes.saturating_sub(candidate.bytes);
-                mark_job_deleted(
-                    config,
-                    jobs,
-                    candidate.id,
-                    "removed by storage retention limit",
-                )
-                .await;
-            }
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                total_bytes = total_bytes.saturating_sub(candidate.bytes);
-                mark_job_deleted(config, jobs, candidate.id, "download directory was missing")
-                    .await;
-            }
-            Err(err) => {
-                metrics.record_cleanup_failure();
-                warn!(
-                    "failed to enforce storage limit job_id={} path={} error={}",
-                    candidate.id,
-                    candidate.directory.display(),
-                    err
-                );
-            }
+        if remove_storage_candidate(config, jobs, metrics, &candidate).await {
+            total_bytes = total_bytes.saturating_sub(candidate.bytes);
+        }
+    }
+}
+
+async fn download_storage_candidates(
+    config: &Config,
+    jobs: &RwLock<HashMap<Uuid, JobRecord>>,
+) -> Vec<DownloadStorageCandidate> {
+    let jobs = jobs.read().await;
+    jobs.values()
+        .filter_map(|record| download_storage_candidate(config, record))
+        .collect()
+}
+
+fn download_storage_candidate(
+    config: &Config,
+    record: &JobRecord,
+) -> Option<DownloadStorageCandidate> {
+    if record.status != JobStatus::Succeeded {
+        return None;
+    }
+    let result = record.result.as_ref()?;
+    let directory = result.media_path.parent()?.to_path_buf();
+    if !directory.starts_with(&config.downloads_dir) || directory == config.downloads_dir {
+        return None;
+    }
+    Some(DownloadStorageCandidate {
+        id: record.id,
+        updated_at: record.updated_at,
+        bytes: result.media_bytes,
+        directory,
+    })
+}
+
+fn download_storage_bytes(candidates: &[DownloadStorageCandidate]) -> u64 {
+    candidates
+        .iter()
+        .map(|candidate| candidate.bytes)
+        .sum::<u64>()
+}
+
+async fn remove_storage_candidate(
+    config: &Config,
+    jobs: &RwLock<HashMap<Uuid, JobRecord>>,
+    metrics: &AppMetrics,
+    candidate: &DownloadStorageCandidate,
+) -> bool {
+    match tokio::fs::remove_dir_all(&candidate.directory).await {
+        Ok(()) => {
+            mark_job_deleted(
+                config,
+                jobs,
+                candidate.id,
+                "removed by storage retention limit",
+            )
+            .await;
+            true
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            mark_job_deleted(config, jobs, candidate.id, "download directory was missing").await;
+            true
+        }
+        Err(err) => {
+            metrics.record_cleanup_failure();
+            warn!(
+                "failed to enforce storage limit job_id={} path={} error={}",
+                candidate.id,
+                candidate.directory.display(),
+                err
+            );
+            false
         }
     }
 }
@@ -1230,12 +1375,14 @@ mod tests {
         let cancellations = Arc::new(CancellationRegistry::default());
         let (queue_tx, queue_rx) = bounded(1);
         let runtime = start_workers(
-            Arc::clone(&config),
-            Arc::clone(&jobs),
-            Arc::clone(&workers),
-            Arc::clone(&metrics),
-            webhooks,
-            cancellations,
+            WorkerPoolDependencies {
+                config: Arc::clone(&config),
+                jobs: Arc::clone(&jobs),
+                workers: Arc::clone(&workers),
+                metrics: Arc::clone(&metrics),
+                webhooks,
+                cancellations,
+            },
             queue_rx,
         );
         let record = job_record("https://www.instagram.com/reel/abc/");

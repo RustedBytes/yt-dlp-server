@@ -112,28 +112,50 @@ pub fn platform_for_host(host: &str) -> Option<&'static str> {
 pub fn is_supported_video_url(platform: &str, url: &Url, host: &str) -> bool {
     let path = url.path();
     match platform {
-        "tiktok" => {
-            path_contains_segment(path, "video")
-                || !matches!(host, "tiktok.com" | "www.tiktok.com" | "m.tiktok.com")
-        }
-        "instagram" => {
-            path_starts_with_segment(path, "reel") || path_starts_with_segment(path, "reels")
-        }
-        "youtube" if host_matches(host, "youtu.be") => path.trim_matches('/').len() >= 6,
-        "youtube" => path_starts_with_segment(path, "shorts"),
-        "facebook" if host_matches(host, "fb.watch") => !path.trim_matches('/').is_empty(),
-        "facebook" => {
-            path_starts_with_segment(path, "reel")
-                || path_starts_with_segment(path, "watch")
-                || path.starts_with("/share/r/")
-        }
+        "tiktok" => is_tiktok_video_path(path, host),
+        "instagram" => is_instagram_video_path(path),
+        "youtube" => is_youtube_video_path(path, host),
+        "facebook" => is_facebook_video_path(path, host),
         "snapchat" => path_starts_with_segment(path, "spotlight"),
         "douyin" | "yappy" => path_starts_with_segment(path, "video"),
         "rutube" => path_starts_with_segment(path, "shorts"),
-        "likee" => path_starts_with_segment(path, "v") || path_contains_segment(path, "video"),
-        "vk" => path_starts_with_segment(path, "clip") || path_starts_with_segment(path, "video"),
+        "likee" => is_likee_video_path(path),
+        "vk" => is_vk_video_path(path),
         _ => false,
     }
+}
+
+fn is_tiktok_video_path(path: &str, host: &str) -> bool {
+    path_contains_segment(path, "video")
+        || !matches!(host, "tiktok.com" | "www.tiktok.com" | "m.tiktok.com")
+}
+
+fn is_instagram_video_path(path: &str) -> bool {
+    path_starts_with_segment(path, "reel") || path_starts_with_segment(path, "reels")
+}
+
+fn is_youtube_video_path(path: &str, host: &str) -> bool {
+    if host_matches(host, "youtu.be") {
+        return path.trim_matches('/').len() >= 6;
+    }
+    path_starts_with_segment(path, "shorts")
+}
+
+fn is_facebook_video_path(path: &str, host: &str) -> bool {
+    if host_matches(host, "fb.watch") {
+        return !path.trim_matches('/').is_empty();
+    }
+    path_starts_with_segment(path, "reel")
+        || path_starts_with_segment(path, "watch")
+        || path.starts_with("/share/r/")
+}
+
+fn is_likee_video_path(path: &str) -> bool {
+    path_starts_with_segment(path, "v") || path_contains_segment(path, "video")
+}
+
+fn is_vk_video_path(path: &str) -> bool {
+    path_starts_with_segment(path, "clip") || path_starts_with_segment(path, "video")
 }
 
 fn is_known_platform(value: &str) -> bool {

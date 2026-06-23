@@ -22,7 +22,9 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{
     config::Config,
-    jobs::{WebhookClient, load_jobs, start_workers},
+    jobs::{
+        JobRequest, WebhookClient, WorkerPoolDependencies, WorkerRuntime, load_jobs, start_workers,
+    },
 };
 
 #[derive(Debug, Parser)]
@@ -33,14 +35,76 @@ struct Cli {
     config: Option<PathBuf>,
 }
 
+struct ServerRuntime {
+    state: AppState,
+    worker_runtime: WorkerRuntime,
+    cancellations: Arc<CancellationRegistry>,
+    queue_shutdown: async_channel::Sender<JobRequest>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = Arc::new(Config::load(cli.config)?);
 
     init_tracing(&config.rust_log)?;
-
     config.ensure_dirs().await?;
+    log_loaded_config(&config);
+
+    let runtime = build_runtime(Arc::clone(&config)).await?;
+    let app = api::router(runtime.state.clone());
+    let listener = tokio::net::TcpListener::bind(config.addr)
+        .await
+        .context("failed to bind TCP listener")?;
+    log_server_listening(&config);
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    stop_workers(runtime).await;
+
+    Ok(())
+}
+
+async fn build_runtime(config: Arc<Config>) -> anyhow::Result<ServerRuntime> {
+    let (queue_tx, queue_rx) = async_channel::bounded(config.queue_size);
+    let jobs = load_jobs(&config).await?;
+    let workers = Arc::new(WorkerPoolState::new(config.workers));
+    let metrics = Arc::new(AppMetrics::default());
+    let webhooks = Arc::new(WebhookClient::from_config(&config)?);
+    let cancellations = Arc::new(CancellationRegistry::default());
+    let state = AppState {
+        config: Arc::clone(&config),
+        queue_tx,
+        jobs: Arc::new(RwLock::new(jobs)),
+        workers: Arc::clone(&workers),
+        metrics: Arc::clone(&metrics),
+        rate_limiter: Arc::new(RateLimiter::new(config.rate_limit_requests_per_minute)),
+        cancellations: Arc::clone(&cancellations),
+    };
+
+    let queue_shutdown = state.queue_tx.clone();
+    let worker_runtime = start_workers(
+        WorkerPoolDependencies {
+            config,
+            jobs: Arc::clone(&state.jobs),
+            workers,
+            metrics,
+            webhooks,
+            cancellations: Arc::clone(&cancellations),
+        },
+        queue_rx,
+    );
+
+    Ok(ServerRuntime {
+        state,
+        worker_runtime,
+        cancellations,
+        queue_shutdown,
+    })
+}
+
+fn log_loaded_config(config: &Config) {
     debug!(
         "config loaded addr={} data_dir={} downloads_dir={} metadata_dir={} workers={} queue_size={} body_limit_bytes={} request_timeout_seconds={} api_key_auth_enabled={} rate_limit_requests_per_minute={} yt_dlp_command={} cookies_configured={} format_configured={} proxy_configured={} enabled_platforms={} max_urls_per_request={} job_timeout_seconds={} download_max_attempts={} download_initial_backoff_ms={} max_download_storage_bytes={} webhook_timeout_seconds={} webhook_connect_timeout_seconds={} webhook_max_attempts={} webhook_initial_backoff_ms={} webhook_signing_enabled={} allow_private_webhook_urls={} rust_log={}",
         config.addr,
@@ -71,39 +135,9 @@ async fn main() -> anyhow::Result<()> {
         config.allow_private_webhook_urls,
         config.rust_log
     );
+}
 
-    let (queue_tx, queue_rx) = async_channel::bounded(config.queue_size);
-    let jobs = load_jobs(&config).await?;
-    let workers = Arc::new(WorkerPoolState::new(config.workers));
-    let metrics = Arc::new(AppMetrics::default());
-    let webhooks = Arc::new(WebhookClient::from_config(&config)?);
-    let cancellations = Arc::new(CancellationRegistry::default());
-    let state = AppState {
-        config: Arc::clone(&config),
-        queue_tx,
-        jobs: Arc::new(RwLock::new(jobs)),
-        workers: Arc::clone(&workers),
-        metrics: Arc::clone(&metrics),
-        rate_limiter: Arc::new(RateLimiter::new(config.rate_limit_requests_per_minute)),
-        cancellations: Arc::clone(&cancellations),
-    };
-
-    let worker_runtime = start_workers(
-        Arc::clone(&config),
-        Arc::clone(&state.jobs),
-        workers,
-        metrics,
-        webhooks,
-        Arc::clone(&cancellations),
-        queue_rx,
-    );
-
-    let queue_shutdown = state.queue_tx.clone();
-    let app = api::router(state);
-    let listener = tokio::net::TcpListener::bind(config.addr)
-        .await
-        .context("failed to bind TCP listener")?;
-
+fn log_server_listening(config: &Config) {
     info!(
         "server listening addr={} workers={} data_dir={} downloads_dir={} queue_size={} body_limit_bytes={} request_timeout_seconds={} api_key_auth_enabled={} rate_limit_requests_per_minute={} yt_dlp_command={} cookies_configured={} format_configured={} proxy_configured={} enabled_platforms={} max_urls_per_request={} job_timeout_seconds={} download_max_attempts={} download_initial_backoff_ms={} max_download_storage_bytes={} webhook_timeout_seconds={} webhook_connect_timeout_seconds={} webhook_max_attempts={} webhook_initial_backoff_ms={} webhook_signing_enabled={} allow_private_webhook_urls={}",
         config.addr,
@@ -132,18 +166,15 @@ async fn main() -> anyhow::Result<()> {
         config.webhook_signing_secret.is_some(),
         config.allow_private_webhook_urls
     );
+}
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+async fn stop_workers(runtime: ServerRuntime) {
     info!("server shutdown requested; stopping download workers");
-    worker_runtime.request_shutdown();
-    cancellations.cancel_all();
-    queue_shutdown.close();
-    worker_runtime.wait().await;
+    runtime.worker_runtime.request_shutdown();
+    runtime.cancellations.cancel_all();
+    runtime.queue_shutdown.close();
+    runtime.worker_runtime.wait().await;
     info!("download workers stopped");
-
-    Ok(())
 }
 
 async fn shutdown_signal() {
