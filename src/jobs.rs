@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io::ErrorKind,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -221,6 +221,7 @@ pub async fn load_jobs(config: &Config) -> anyhow::Result<HashMap<Uuid, JobRecor
         if matches!(record.status, JobStatus::Queued | JobStatus::Running) {
             record.status = JobStatus::Failed;
             record.updated_at = time::OffsetDateTime::now_utc();
+            record.error_kind = Some("interrupted".to_string());
             record.error = Some("server restarted before job reached a terminal state".to_string());
             recovered.push(record.clone());
         }
@@ -403,6 +404,7 @@ async fn persist_unqueued_record(
 ) -> Result<(), EnqueueError> {
     record.status = JobStatus::Failed;
     record.updated_at = time::OffsetDateTime::now_utc();
+    record.error_kind = Some(classify_error(error).to_string());
     record.error = Some(error.to_string());
     append_jsonl(results_jsonl, &record)
         .await
@@ -488,11 +490,13 @@ async fn finish_job(
                 Ok(metadata) => {
                     record.status = JobStatus::Succeeded;
                     record.result = Some(metadata);
+                    record.error_kind = None;
                     record.error = None;
                     info!("job succeeded job_id={}", id);
                 }
                 Err(err) => {
                     record.status = JobStatus::Failed;
+                    record.error_kind = Some(classify_error(&err.to_string()).to_string());
                     record.error = Some(err.to_string());
                     warn!("job failed job_id={} error={}", id, err);
                 }
@@ -511,6 +515,7 @@ async fn finish_job(
             );
         }
         send_webhook(metrics, webhooks, &record).await;
+        enforce_download_storage_limit(config, jobs, metrics).await;
         {
             let mut jobs = jobs.write().await;
             retain_recent_jobs(&mut jobs, config.job_retention_limit);
@@ -581,6 +586,142 @@ fn is_timeout_error(result: &anyhow::Result<DownloadMetadata>) -> bool {
         .is_some_and(|err| err.to_string().contains("timed out after"))
 }
 
+fn classify_error(error: &str) -> &'static str {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("timed out") {
+        "timeout"
+    } else if normalized.contains("429")
+        || normalized.contains("too many requests")
+        || normalized.contains("rate limit")
+    {
+        "rate_limited"
+    } else if normalized.contains("login")
+        || normalized.contains("sign in")
+        || normalized.contains("cookie")
+        || normalized.contains("private")
+    {
+        "authentication_required"
+    } else if normalized.contains("unsupported url") || normalized.contains("no suitable extractor")
+    {
+        "unsupported_url"
+    } else if normalized.contains("yt-dlp failed") {
+        "downloader_failed"
+    } else {
+        "download_failed"
+    }
+}
+
+#[derive(Debug)]
+struct DownloadStorageCandidate {
+    id: Uuid,
+    updated_at: time::OffsetDateTime,
+    bytes: u64,
+    directory: PathBuf,
+}
+
+async fn enforce_download_storage_limit(
+    config: &Config,
+    jobs: &RwLock<HashMap<Uuid, JobRecord>>,
+    metrics: &AppMetrics,
+) {
+    if config.max_download_storage_bytes == 0 {
+        return;
+    }
+
+    let mut candidates = {
+        let jobs = jobs.read().await;
+        jobs.values()
+            .filter_map(|record| {
+                if record.status != JobStatus::Succeeded {
+                    return None;
+                }
+                let result = record.result.as_ref()?;
+                let directory = result.media_path.parent()?.to_path_buf();
+                if !directory.starts_with(&config.downloads_dir)
+                    || directory == config.downloads_dir
+                {
+                    return None;
+                }
+                Some(DownloadStorageCandidate {
+                    id: record.id,
+                    updated_at: record.updated_at,
+                    bytes: result.media_bytes,
+                    directory,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut total_bytes = candidates
+        .iter()
+        .map(|candidate| candidate.bytes)
+        .sum::<u64>();
+    if total_bytes <= config.max_download_storage_bytes {
+        return;
+    }
+
+    candidates.sort_by_key(|candidate| candidate.updated_at);
+    for candidate in candidates {
+        if total_bytes <= config.max_download_storage_bytes {
+            break;
+        }
+
+        match tokio::fs::remove_dir_all(&candidate.directory).await {
+            Ok(()) => {
+                total_bytes = total_bytes.saturating_sub(candidate.bytes);
+                mark_job_deleted(
+                    config,
+                    jobs,
+                    candidate.id,
+                    "removed by storage retention limit",
+                )
+                .await;
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                total_bytes = total_bytes.saturating_sub(candidate.bytes);
+                mark_job_deleted(config, jobs, candidate.id, "download directory was missing")
+                    .await;
+            }
+            Err(err) => {
+                metrics.record_cleanup_failure();
+                warn!(
+                    "failed to enforce storage limit job_id={} path={} error={}",
+                    candidate.id,
+                    candidate.directory.display(),
+                    err
+                );
+            }
+        }
+    }
+}
+
+async fn mark_job_deleted(
+    config: &Config,
+    jobs: &RwLock<HashMap<Uuid, JobRecord>>,
+    id: Uuid,
+    reason: &str,
+) {
+    let mut record = None;
+    {
+        let mut jobs = jobs.write().await;
+        if let Some(job) = jobs.get_mut(&id) {
+            job.status = JobStatus::Deleted;
+            job.updated_at = time::OffsetDateTime::now_utc();
+            job.result = None;
+            job.error_kind = Some("cleanup".to_string());
+            job.error = Some(reason.to_string());
+            record = Some(job.clone());
+        }
+    }
+    if let Some(record) = record
+        && let Err(err) = append_jsonl(&config.results_jsonl, &record).await
+    {
+        warn!(
+            "failed to append storage cleanup tombstone job_id={} error={}",
+            id, err
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{net::SocketAddr, path::PathBuf};
@@ -611,8 +752,12 @@ mod tests {
             rust_log: "info".to_string(),
             yt_dlp_command: "uv".to_string(),
             cookies_path: None,
+            format: None,
+            proxy: None,
             max_urls_per_request: 100,
             job_timeout_seconds: 300,
+            max_download_storage_bytes: 0,
+            min_free_disk_bytes: 0,
             webhook_timeout_seconds: 10,
             webhook_connect_timeout_seconds: 5,
             webhook_max_attempts: 1,
@@ -633,6 +778,7 @@ mod tests {
             url: url.to_string(),
             webhook_url: None,
             result: None,
+            error_kind: None,
             error: None,
         }
     }
@@ -708,11 +854,56 @@ mod tests {
         tokio::fs::remove_dir_all(&config.data_dir).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn storage_limit_deletes_oldest_completed_download() {
+        let mut config = temp_config("storage-limit");
+        config.max_download_storage_bytes = 5;
+        tokio::fs::create_dir_all(&config.metadata_dir)
+            .await
+            .unwrap();
+        let jobs = Arc::new(RwLock::new(HashMap::new()));
+        let older = completed_record(&config, "older", 4).await;
+        let newer = completed_record(&config, "newer", 4).await;
+        {
+            let mut jobs = jobs.write().await;
+            jobs.insert(older.id, older.clone());
+            jobs.insert(newer.id, newer.clone());
+        }
+
+        enforce_download_storage_limit(&config, &jobs, &AppMetrics::default()).await;
+
+        let jobs = jobs.read().await;
+        assert_eq!(jobs.get(&older.id).unwrap().status, JobStatus::Deleted);
+        assert_eq!(jobs.get(&newer.id).unwrap().status, JobStatus::Succeeded);
+        assert!(!config.downloads_dir.join(older.id.to_string()).exists());
+        assert!(config.downloads_dir.join(newer.id.to_string()).exists());
+
+        tokio::fs::remove_dir_all(&config.data_dir).await.unwrap();
+    }
+
     #[test]
     fn timeout_errors_are_classified() {
         let result = Err(anyhow!("job timed out after 5 seconds"));
 
         assert!(is_timeout_error(&result));
+    }
+
+    #[test]
+    fn classifies_common_download_errors() {
+        assert_eq!(classify_error("job timed out after 5 seconds"), "timeout");
+        assert_eq!(
+            classify_error("HTTP Error 429: Too Many Requests"),
+            "rate_limited"
+        );
+        assert_eq!(
+            classify_error("please sign in or pass cookies"),
+            "authentication_required"
+        );
+        assert_eq!(classify_error("Unsupported URL"), "unsupported_url");
+        assert_eq!(
+            classify_error("yt-dlp failed with status 1"),
+            "downloader_failed"
+        );
     }
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -721,5 +912,36 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("yt-dlp-server-{nanos}-{name}"))
+    }
+
+    async fn completed_record(config: &Config, label: &str, bytes: u64) -> JobRecord {
+        let mut record = job_record(&format!("https://www.youtube.com/shorts/{label}"));
+        record.status = JobStatus::Succeeded;
+        if label == "older" {
+            record.updated_at -= time::Duration::seconds(60);
+        }
+        let directory = config.downloads_dir.join(record.id.to_string());
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let media_path = directory.join(format!("{}.mp4", record.id));
+        let info_json_path = directory.join(format!("{}.info.json", record.id));
+        tokio::fs::write(&media_path, vec![b'x'; bytes as usize])
+            .await
+            .unwrap();
+        tokio::fs::write(&info_json_path, b"{}").await.unwrap();
+        record.result = Some(DownloadMetadata {
+            original_url: record.url.clone(),
+            webpage_url: None,
+            extractor: None,
+            title: None,
+            uploader: None,
+            duration: None,
+            extension: Some("mp4".to_string()),
+            media_path,
+            media_bytes: bytes,
+            info_json_path,
+            yt_dlp_version: "test".to_string(),
+            elapsed_ms: 1,
+        });
+        record
     }
 }

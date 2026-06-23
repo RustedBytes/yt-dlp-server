@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -70,7 +70,7 @@ pub struct WorkerPoolSnapshot {
 #[derive(Debug)]
 pub struct RateLimiter {
     limit_per_minute: u64,
-    state: Mutex<RateLimitWindow>,
+    windows: Mutex<HashMap<String, RateLimitWindow>>,
 }
 
 #[derive(Debug)]
@@ -117,23 +117,27 @@ impl RateLimiter {
     pub fn new(limit_per_minute: u64) -> Self {
         Self {
             limit_per_minute,
-            state: Mutex::new(RateLimitWindow {
-                started_at: Instant::now(),
-                count: 0,
-            }),
+            windows: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn check(&self) -> RateLimitDecision {
+    pub fn check(&self, bucket: &str) -> RateLimitDecision {
         if self.limit_per_minute == 0 {
             return RateLimitDecision::Allowed;
         }
 
-        let mut state = self
-            .state
+        let mut windows = self
+            .windows
             .lock()
             .expect("rate limiter mutex should not be poisoned");
         let now = Instant::now();
+        let state = match windows.entry(bucket.to_string()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(RateLimitWindow {
+                started_at: now,
+                count: 0,
+            }),
+        };
         let elapsed = now.duration_since(state.started_at);
         if elapsed >= Duration::from_secs(60) {
             state.started_at = now;
@@ -201,6 +205,10 @@ impl AppMetrics {
         self.webhook_failures.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_cleanup_failure(&self) {
+        self.cleanup_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             jobs_started: self.jobs_started.load(Ordering::Relaxed),
@@ -227,7 +235,7 @@ mod tests {
         let limiter = RateLimiter::new(0);
 
         for _ in 0..10 {
-            assert_eq!(limiter.check(), RateLimitDecision::Allowed);
+            assert_eq!(limiter.check("global"), RateLimitDecision::Allowed);
         }
     }
 
@@ -235,12 +243,13 @@ mod tests {
     fn rate_limiter_rejects_after_window_limit() {
         let limiter = RateLimiter::new(1);
 
-        assert_eq!(limiter.check(), RateLimitDecision::Allowed);
+        assert_eq!(limiter.check("a"), RateLimitDecision::Allowed);
         assert!(matches!(
-            limiter.check(),
+            limiter.check("a"),
             RateLimitDecision::Limited {
                 retry_after: 1..=60
             }
         ));
+        assert_eq!(limiter.check("b"), RateLimitDecision::Allowed);
     }
 }

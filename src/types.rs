@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -11,6 +11,29 @@ pub enum JobStatus {
     Running,
     Succeeded,
     Failed,
+    Deleted,
+}
+
+impl fmt::Display for JobStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Deleted => "deleted",
+        })
+    }
+}
+
+impl JobStatus {
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed)
+    }
+
+    pub fn is_deletable(&self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +47,8 @@ pub struct JobRecord {
     pub url: String,
     pub webhook_url: Option<String>,
     pub result: Option<DownloadMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
     pub error: Option<String>,
 }
 
@@ -56,6 +81,21 @@ pub struct BatchQueueResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobListResponse {
+    pub jobs: Vec<JobRecord>,
+    pub total: usize,
+    pub limit: usize,
+    pub offset: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteJobResponse {
+    pub id: Uuid,
+    pub deleted: bool,
+    pub media_deleted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: &'static str,
     pub ready: bool,
@@ -75,6 +115,8 @@ pub struct ErrorResponse {
 pub struct ReadinessResponse {
     pub status: &'static str,
     pub ready: bool,
+    pub downloader_ready: bool,
+    pub downloader_error: Option<String>,
     pub workers: WorkerHealth,
     pub queued: usize,
 }

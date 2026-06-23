@@ -13,3 +13,7 @@ Successful downloads are retained under `data/downloads/<job-id>/`. Each directo
 Failed or timed-out downloads remove their partial `data/downloads/<job-id>/` directory on a best-effort basis.
 
 The in-memory job map is bounded by `retention.job_retention_limit`. Metadata compaction at startup is bounded by `retention.metadata_retention_limit`.
+
+When `download.max_download_storage_bytes` is greater than `0`, the worker prunes the oldest succeeded download directories after jobs complete until retained media is under the configured byte limit. Pruned jobs are marked `deleted` and a tombstone record is appended to `download_results.jsonl`.
+
+When `download.min_free_disk_bytes` is greater than `0`, each job checks available space in the download directory before running `yt-dlp` and fails before download if the threshold is not met.

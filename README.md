@@ -4,6 +4,8 @@
 
 Minimal Axum server for queueing short-form social video downloads with `yt-dlp` through `uv`.
 
+![Server preview](docs/demo.jpg)
+
 ## Documentation
 
 - [Running the server](docs/running.md)
@@ -11,6 +13,7 @@ Minimal Axum server for queueing short-form social video downloads with `yt-dlp`
 - [Python client](docs/python-client.md)
 - [URL input](docs/tasks.md)
 - [Configuration](docs/configuration.md)
+- [Deployment](docs/deployment.md)
 - [Metadata and cleanup](docs/metadata-and-cleanup.md)
 
 ## Author

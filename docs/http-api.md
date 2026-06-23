@@ -12,7 +12,7 @@ Readiness:
 curl http://127.0.0.1:3000/ready
 ```
 
-`/health` is a liveness endpoint. `/ready` returns `200` when at least one download worker is ready.
+`/health` is a liveness endpoint. `/ready` returns `200` when at least one download worker is ready and the configured `yt-dlp` command passes a version check. When the downloader runtime is broken, the readiness response includes `downloader_ready: false` and `downloader_error`.
 
 When `server.api_keys` is configured, all endpoints except `/health` and `/ready` require an API key:
 
@@ -101,6 +101,32 @@ Check job:
 curl http://127.0.0.1:3000/v1/jobs/<job-id>
 ```
 
+Failed jobs include a human-readable `error` and, when classified, a stable `error_kind` such as `timeout`, `rate_limited`, `authentication_required`, `unsupported_url`, `downloader_failed`, or `download_failed`.
+
+List recent jobs:
+
+```bash
+curl 'http://127.0.0.1:3000/v1/jobs?status=succeeded&limit=50&offset=0'
+```
+
+Download completed media:
+
+```bash
+curl -OJ http://127.0.0.1:3000/v1/jobs/<job-id>/media
+```
+
+Retry a terminal failed or succeeded job as a new queued job:
+
+```bash
+curl -s -X POST http://127.0.0.1:3000/v1/jobs/<job-id>/retry
+```
+
+Delete a terminal job's downloaded files and mark the job as deleted:
+
+```bash
+curl -s -X DELETE http://127.0.0.1:3000/v1/jobs/<job-id>
+```
+
 Errors use a stable JSON shape:
 
 ```json
@@ -110,6 +136,6 @@ Errors use a stable JSON shape:
 }
 ```
 
-Known error codes are `bad_request`, `not_found`, `unauthorized`, `rate_limited`, `service_unavailable`, and `internal_error`.
+Known error codes are `bad_request`, `not_found`, `conflict`, `unauthorized`, `rate_limited`, `service_unavailable`, and `internal_error`.
 
 Requests return `408` if they exceed the configured `queue.request_timeout_seconds` limit, `401` if API key authentication is enabled and the key is missing or invalid, and `429` if rate limiting is enabled and the process-wide limit is exceeded. Download submissions return `503` when no worker is ready, when the queue is full, or when the queue has closed.

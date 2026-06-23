@@ -10,7 +10,7 @@ cors_allowed_origins = []
 # When set, send either `x-api-key: <key>` or `Authorization: Bearer <key>`.
 api_keys = []
 
-# Disabled by default. When greater than 0, applies a process-wide request limit.
+# Disabled by default. When greater than 0, applies per-key limits when API keys are configured.
 rate_limit_requests_per_minute = 0
 
 [queue]
@@ -25,10 +25,18 @@ workers = 1
 output_dir = "data/downloads"
 yt_dlp_command = "uv"
 cookies_path = ""
+format = ""
+proxy = ""
 max_urls_per_request = 100
 
 # Set to 0 to disable per-job timeout enforcement.
 job_timeout_seconds = 1800
+
+# Set to 0 to disable automatic storage cleanup.
+max_download_storage_bytes = 0
+
+# Set to 0 to disable the free-space preflight check.
+min_free_disk_bytes = 0
 
 [retention]
 # Limits how many jobs stay queryable in memory. Set to 0 to retain none.

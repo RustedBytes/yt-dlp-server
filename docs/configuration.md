@@ -34,8 +34,12 @@ workers = 1
 output_dir = "data/downloads"
 yt_dlp_command = "uv"
 cookies_path = ""
+format = ""
+proxy = ""
 max_urls_per_request = 100
 job_timeout_seconds = 1800
+max_download_storage_bytes = 0
+min_free_disk_bytes = 0
 
 [webhooks]
 webhook_timeout_seconds = 10
@@ -55,7 +59,7 @@ Environment variables override TOML values when set:
 - `DATA_DIR`: metadata directory base, default `data`
 - `CORS_ALLOWED_ORIGINS`: comma-separated origins allowed by browser CORS checks
 - `API_KEYS`: comma-separated accepted API keys; empty disables API key authentication
-- `RATE_LIMIT_REQUESTS_PER_MINUTE`: process-wide request limit; set to `0` to disable rate limiting
+- `RATE_LIMIT_REQUESTS_PER_MINUTE`: per-key request limit when API keys are configured, or shared anonymous limit otherwise; set to `0` to disable rate limiting
 - `QUEUE_SIZE`: queued job capacity
 - `BODY_LIMIT_BYTES`: JSON/form body limit
 - `REQUEST_TIMEOUT_SECONDS`: whole HTTP request timeout; set to `0` to disable timeout enforcement
@@ -63,8 +67,12 @@ Environment variables override TOML values when set:
 - `DOWNLOAD_OUTPUT_DIR`: directory where per-job download folders are written
 - `YT_DLP_COMMAND`: command to execute; `uv` expands to `uv run --frozen yt-dlp`
 - `YT_DLP_COOKIES_PATH`: optional server-side cookie file passed as `--cookies`
+- `YT_DLP_FORMAT`: optional yt-dlp format selector passed as `--format`
+- `YT_DLP_PROXY`: optional proxy URL passed as `--proxy`
 - `MAX_URLS_PER_REQUEST`: maximum non-empty URLs accepted in one submission
 - `JOB_TIMEOUT_SECONDS`: per-download timeout; set to `0` to disable timeout enforcement
+- `MAX_DOWNLOAD_STORAGE_BYTES`: maximum retained downloaded media bytes; set to `0` to disable automatic cleanup
+- `MIN_FREE_DISK_BYTES`: minimum free bytes required in the download directory before starting a job; set to `0` to disable the preflight check
 - `JOB_RETENTION_LIMIT`: maximum in-memory job records kept queryable through `/v1/jobs/{id}`
 - `METADATA_RETENTION_LIMIT`: maximum latest metadata records kept when JSONL files are compacted at startup; set to `0` to disable compaction
 - `WEBHOOK_TIMEOUT_SECONDS`: total outbound webhook request timeout; set to `0` to disable

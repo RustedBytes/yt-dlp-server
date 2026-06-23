@@ -1,6 +1,6 @@
 use askama::Template;
 
-use crate::types::QueueResponse;
+use crate::types::{JobRecord, QueueResponse};
 
 #[derive(Template)]
 #[template(
@@ -44,6 +44,9 @@ use crate::types::QueueResponse;
       display: grid;
       gap: 18px;
     }
+    .action-form {
+      display: inline;
+    }
     label {
       display: block;
       margin-bottom: 8px;
@@ -78,6 +81,25 @@ use crate::types::QueueResponse;
     button:hover {
       background: #1d4ed8;
     }
+    .action-button {
+      margin-left: 8px;
+      border: 1px solid #cbd2d9;
+      padding: 4px 8px;
+      font-size: 12px;
+      font-weight: 650;
+      color: #1f2933;
+      background: #ffffff;
+    }
+    .action-button:hover {
+      background: #f5f7fa;
+    }
+    .action-button.danger {
+      border-color: #f3b5b5;
+      color: #8a1f1f;
+    }
+    .action-button.danger:hover {
+      background: #fff1f1;
+    }
     .notice,
     .error {
       margin-top: 22px;
@@ -97,6 +119,29 @@ use crate::types::QueueResponse;
     ul {
       margin: 10px 0 0;
       padding-left: 20px;
+    }
+    table {
+      width: 100%;
+      margin-top: 26px;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th,
+    td {
+      border-top: 1px solid #e4e7eb;
+      padding: 10px 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      color: #52606d;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .url-cell {
+      max-width: 360px;
+      overflow-wrap: anywhere;
     }
     code {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -134,10 +179,57 @@ use crate::types::QueueResponse;
     </div>
     {% endif %}
 
+    {% if notice != "" %}
+    <div class="notice">{{ notice }}</div>
+    {% endif %}
+
     {% if error != "" %}
     <div class="error">{{ error }}</div>
     {% endif %}
+
+    {% if recent_jobs.len() > 0 %}
+    <table>
+      <thead>
+        <tr>
+          <th>Job</th>
+          <th>Status</th>
+          <th>URL</th>
+          <th>Links</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for job in recent_jobs %}
+        <tr>
+          <td><code>{{ job.id }}</code></td>
+          <td>{{ job.status }}</td>
+          <td class="url-cell">{{ job.url }}</td>
+          <td>
+            <a href="/v1/jobs/{{ job.id }}">status</a>
+            {% if job.result.is_some() %}
+            · <a href="/v1/jobs/{{ job.id }}/media">media</a>
+            {% endif %}
+            {% if job.status.is_retryable() %}
+            <form class="action-form" method="post" action="/jobs-form/{{ job.id }}/retry">
+              <button class="action-button" type="submit">Retry</button>
+            </form>
+            {% endif %}
+            {% if job.status.is_deletable() %}
+            <form class="action-form" method="post" action="/jobs-form/{{ job.id }}/delete">
+              <button class="action-button danger" type="submit">Delete</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
   </main>
+  {% if has_active_jobs %}
+  <script>
+    window.setTimeout(() => window.location.reload(), 5000);
+  </script>
+  {% endif %}
 </body>
 </html>
 "###,
@@ -145,5 +237,8 @@ use crate::types::QueueResponse;
 )]
 pub struct IndexTemplate {
     pub queued_jobs: Vec<QueueResponse>,
+    pub notice: String,
+    pub has_active_jobs: bool,
+    pub recent_jobs: Vec<JobRecord>,
     pub error: String,
 }

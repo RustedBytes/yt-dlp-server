@@ -13,6 +13,10 @@ use uuid::Uuid;
 
 use crate::{config::Config, types::DownloadMetadata};
 
+pub async fn check_downloader(config: &Config) -> anyhow::Result<String> {
+    yt_dlp_version(config).await
+}
+
 pub async fn download_url(
     config: &Config,
     id: uuid::Uuid,
@@ -31,6 +35,10 @@ pub async fn download_url(
     fs::create_dir_all(&job_dir)
         .await
         .with_context(|| format!("failed to create download dir {}", job_dir.display()))?;
+    if let Err(err) = ensure_min_free_disk_space(config).await {
+        cleanup_partial_download(&job_dir).await;
+        return Err(err);
+    }
 
     let version = yt_dlp_version(config).await.unwrap_or_else(|err| {
         warn!(
@@ -72,6 +80,14 @@ pub fn download_command_args(
     if let Some(cookies_path) = &config.cookies_path {
         args.push(OsString::from("--cookies"));
         args.push(cookies_path.as_os_str().to_os_string());
+    }
+    if let Some(format) = &config.format {
+        args.push(OsString::from("--format"));
+        args.push(OsString::from(format));
+    }
+    if let Some(proxy) = &config.proxy {
+        args.push(OsString::from("--proxy"));
+        args.push(OsString::from(proxy));
     }
     args.push(OsString::from(url));
     args
@@ -151,6 +167,60 @@ async fn run_command_with_timeout(
         Ok(output) => output.with_context(|| format!("failed to wait for `{command}`")),
         Err(_) => Err(anyhow!("job timed out after {timeout_seconds} seconds")),
     }
+}
+
+async fn ensure_min_free_disk_space(config: &Config) -> anyhow::Result<()> {
+    if config.min_free_disk_bytes == 0 {
+        return Ok(());
+    }
+
+    let available = available_disk_bytes(&config.downloads_dir).await?;
+    if available < config.min_free_disk_bytes {
+        return Err(anyhow!(
+            "insufficient free disk space in {}: available {} bytes, required {} bytes",
+            config.downloads_dir.display(),
+            available,
+            config.min_free_disk_bytes
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn available_disk_bytes(path: &Path) -> anyhow::Result<u64> {
+    let output = Command::new("df")
+        .args(["-Pk"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("failed to run df for free disk check")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "df failed for free disk check: {}",
+            process_output_summary(&output.stderr, &output.stdout)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .nth(1)
+        .ok_or_else(|| anyhow!("df output did not include a data row"))?;
+    let available_kib = line
+        .split_whitespace()
+        .nth(3)
+        .ok_or_else(|| anyhow!("df output did not include available space"))?
+        .parse::<u64>()
+        .context("failed to parse available disk space from df")?;
+    available_kib
+        .checked_mul(1024)
+        .ok_or_else(|| anyhow!("available disk space value overflowed"))
+}
+
+#[cfg(not(unix))]
+async fn available_disk_bytes(_path: &Path) -> anyhow::Result<u64> {
+    Ok(u64::MAX)
 }
 
 async fn metadata_from_download_dir(
@@ -304,6 +374,8 @@ mod tests {
     fn builds_uv_download_command_with_cookie_file() {
         let mut config = test_config();
         config.cookies_path = Some(PathBuf::from("cookies.txt"));
+        config.format = Some("bv*+ba/b".to_string());
+        config.proxy = Some("socks5://127.0.0.1:1080".to_string());
         let id = Uuid::parse_str("10af7128-4b98-4e19-a494-17a3d5597e2c").unwrap();
 
         let args = download_command_args(
@@ -320,6 +392,10 @@ mod tests {
         assert!(args.contains(&format!("{id}.%(ext)s")));
         assert!(args.contains(&"--cookies".to_string()));
         assert!(args.contains(&"cookies.txt".to_string()));
+        assert!(args.contains(&"--format".to_string()));
+        assert!(args.contains(&"bv*+ba/b".to_string()));
+        assert!(args.contains(&"--proxy".to_string()));
+        assert!(args.contains(&"socks5://127.0.0.1:1080".to_string()));
         assert_eq!(
             args.last().unwrap(),
             "https://www.tiktok.com/@user/video/123"
@@ -384,6 +460,181 @@ mod tests {
         fs::remove_dir_all(dir).await.unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_url_uses_fake_yt_dlp_successfully() {
+        let root = temp_dir("fake-success");
+        fs::create_dir_all(&root).await.unwrap();
+        let command = fake_yt_dlp(
+            &root,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo fake-yt-dlp
+  exit 0
+fi
+dir=""
+template=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --paths) shift; dir="${1#home:}" ;;
+    -o) shift; template="$1" ;;
+  esac
+  shift
+done
+base="${template%%.*}"
+mkdir -p "$dir"
+printf 'video' > "$dir/$base.mp4"
+cat > "$dir/$base.info.json" <<JSON
+{"webpage_url":"https://www.youtube.com/shorts/abc","extractor":"Fake","title":"Fake title","ext":"mp4"}
+JSON
+"#,
+        )
+        .await;
+        let mut config = test_config();
+        config.yt_dlp_command = command.to_string_lossy().into_owned();
+        config.downloads_dir = root.join("downloads");
+        let id = Uuid::parse_str("10af7128-4b98-4e19-a494-17a3d5597e2c").unwrap();
+
+        let metadata = download_url(&config, id, "https://www.youtube.com/shorts/abc")
+            .await
+            .unwrap();
+
+        assert_eq!(metadata.yt_dlp_version, "fake-yt-dlp");
+        assert_eq!(
+            metadata.media_path,
+            config
+                .downloads_dir
+                .join(id.to_string())
+                .join(format!("{id}.mp4"))
+        );
+        assert_eq!(
+            metadata.info_json_path,
+            config
+                .downloads_dir
+                .join(id.to_string())
+                .join(format!("{id}.info.json"))
+        );
+        assert_eq!(metadata.media_bytes, 5);
+
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_url_cleans_partial_directory_on_failure() {
+        let root = temp_dir("fake-failure");
+        fs::create_dir_all(&root).await.unwrap();
+        let command = fake_yt_dlp(
+            &root,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo fake-yt-dlp
+  exit 0
+fi
+dir=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--paths" ]; then
+    shift
+    dir="${1#home:}"
+  fi
+  shift
+done
+mkdir -p "$dir"
+printf partial > "$dir/partial.part"
+echo failed >&2
+exit 7
+"#,
+        )
+        .await;
+        let mut config = test_config();
+        config.yt_dlp_command = command.to_string_lossy().into_owned();
+        config.downloads_dir = root.join("downloads");
+        let id = Uuid::new_v4();
+
+        let err = download_url(&config, id, "https://www.youtube.com/shorts/abc")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("yt-dlp failed"));
+        assert!(!config.downloads_dir.join(id.to_string()).exists());
+
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_url_cleans_partial_directory_on_timeout() {
+        let root = temp_dir("fake-timeout");
+        fs::create_dir_all(&root).await.unwrap();
+        let command = fake_yt_dlp(
+            &root,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo fake-yt-dlp
+  exit 0
+fi
+dir=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--paths" ]; then
+    shift
+    dir="${1#home:}"
+  fi
+  shift
+done
+mkdir -p "$dir"
+printf partial > "$dir/partial.part"
+sleep 5
+"#,
+        )
+        .await;
+        let mut config = test_config();
+        config.yt_dlp_command = command.to_string_lossy().into_owned();
+        config.downloads_dir = root.join("downloads");
+        config.job_timeout_seconds = 1;
+        let id = Uuid::new_v4();
+
+        let err = download_url(&config, id, "https://www.youtube.com/shorts/abc")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("timed out"));
+        assert!(!config.downloads_dir.join(id.to_string()).exists());
+
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_url_rejects_when_min_free_disk_space_is_not_met() {
+        let root = temp_dir("disk-space");
+        fs::create_dir_all(&root).await.unwrap();
+        let command = fake_yt_dlp(
+            &root,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo fake-yt-dlp
+  exit 0
+fi
+exit 0
+"#,
+        )
+        .await;
+        let mut config = test_config();
+        config.yt_dlp_command = command.to_string_lossy().into_owned();
+        config.downloads_dir = root.join("downloads");
+        config.min_free_disk_bytes = u64::MAX;
+        let id = Uuid::new_v4();
+
+        let err = download_url(&config, id, "https://www.youtube.com/shorts/abc")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("insufficient free disk space"));
+        assert!(!config.downloads_dir.join(id.to_string()).exists());
+
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
     fn test_config() -> Config {
         Config {
             addr: SocketAddr::from(([127, 0, 0, 1], 3000)),
@@ -404,8 +655,12 @@ mod tests {
             rust_log: "info".to_string(),
             yt_dlp_command: "uv".to_string(),
             cookies_path: None,
+            format: None,
+            proxy: None,
             max_urls_per_request: 100,
             job_timeout_seconds: 300,
+            max_download_storage_bytes: 0,
+            min_free_disk_bytes: 0,
             webhook_timeout_seconds: 10,
             webhook_connect_timeout_seconds: 5,
             webhook_max_attempts: 1,
@@ -422,5 +677,17 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("yt-dlp-server-{nanos}-{name}"))
+    }
+
+    #[cfg(unix)]
+    async fn fake_yt_dlp(root: &Path, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = root.join("fake-yt-dlp");
+        fs::write(&path, script).await.unwrap();
+        let mut permissions = fs::metadata(&path).await.unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).await.unwrap();
+        path
     }
 }
