@@ -1,0 +1,6 @@
+/target
+/data
+/.env
+/config.toml
+/Florence-2-base
+/.venv

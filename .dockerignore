@@ -1,0 +1,10 @@
+.git/
+.github/
+target/
+data/
+.venv/
+
+.DS_Store
+*.log
+
+config.toml
