@@ -1,7 +1,10 @@
+#![recursion_limit = "256"]
+
 mod api;
 mod config;
 mod downloader;
 mod jobs;
+mod platforms;
 mod state;
 mod templates;
 mod types;
@@ -12,7 +15,7 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::{Context, anyhow};
 use clap::Parser;
 use log::{debug, info};
-use state::{AppMetrics, AppState, RateLimiter, WorkerPoolState};
+use state::{AppMetrics, AppState, CancellationRegistry, RateLimiter, WorkerPoolState};
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
@@ -38,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
 
     config.ensure_dirs().await?;
     debug!(
-        "config loaded addr={} data_dir={} downloads_dir={} metadata_dir={} workers={} queue_size={} body_limit_bytes={} request_timeout_seconds={} api_key_auth_enabled={} rate_limit_requests_per_minute={} yt_dlp_command={} cookies_configured={} format_configured={} proxy_configured={} max_urls_per_request={} job_timeout_seconds={} download_max_attempts={} download_initial_backoff_ms={} max_download_storage_bytes={} webhook_timeout_seconds={} webhook_connect_timeout_seconds={} webhook_max_attempts={} webhook_initial_backoff_ms={} webhook_signing_enabled={} allow_private_webhook_urls={} rust_log={}",
+        "config loaded addr={} data_dir={} downloads_dir={} metadata_dir={} workers={} queue_size={} body_limit_bytes={} request_timeout_seconds={} api_key_auth_enabled={} rate_limit_requests_per_minute={} yt_dlp_command={} cookies_configured={} format_configured={} proxy_configured={} enabled_platforms={} max_urls_per_request={} job_timeout_seconds={} download_max_attempts={} download_initial_backoff_ms={} max_download_storage_bytes={} webhook_timeout_seconds={} webhook_connect_timeout_seconds={} webhook_max_attempts={} webhook_initial_backoff_ms={} webhook_signing_enabled={} allow_private_webhook_urls={} rust_log={}",
         config.addr,
         config.data_dir.display(),
         config.downloads_dir.display(),
@@ -53,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         config.cookies_path.is_some(),
         config.format.is_some(),
         config.proxy.is_some(),
+        config.download_enabled_platforms.join(","),
         config.max_urls_per_request,
         config.job_timeout_seconds,
         config.download_max_attempts,
@@ -72,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
     let workers = Arc::new(WorkerPoolState::new(config.workers));
     let metrics = Arc::new(AppMetrics::default());
     let webhooks = Arc::new(WebhookClient::from_config(&config)?);
+    let cancellations = Arc::new(CancellationRegistry::default());
     let state = AppState {
         config: Arc::clone(&config),
         queue_tx,
@@ -79,24 +84,27 @@ async fn main() -> anyhow::Result<()> {
         workers: Arc::clone(&workers),
         metrics: Arc::clone(&metrics),
         rate_limiter: Arc::new(RateLimiter::new(config.rate_limit_requests_per_minute)),
+        cancellations: Arc::clone(&cancellations),
     };
 
-    start_workers(
+    let worker_runtime = start_workers(
         Arc::clone(&config),
         Arc::clone(&state.jobs),
         workers,
         metrics,
         webhooks,
+        Arc::clone(&cancellations),
         queue_rx,
     );
 
+    let queue_shutdown = state.queue_tx.clone();
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(config.addr)
         .await
         .context("failed to bind TCP listener")?;
 
     info!(
-        "server listening addr={} workers={} data_dir={} downloads_dir={} queue_size={} body_limit_bytes={} request_timeout_seconds={} api_key_auth_enabled={} rate_limit_requests_per_minute={} yt_dlp_command={} cookies_configured={} format_configured={} proxy_configured={} max_urls_per_request={} job_timeout_seconds={} download_max_attempts={} download_initial_backoff_ms={} max_download_storage_bytes={} webhook_timeout_seconds={} webhook_connect_timeout_seconds={} webhook_max_attempts={} webhook_initial_backoff_ms={} webhook_signing_enabled={} allow_private_webhook_urls={}",
+        "server listening addr={} workers={} data_dir={} downloads_dir={} queue_size={} body_limit_bytes={} request_timeout_seconds={} api_key_auth_enabled={} rate_limit_requests_per_minute={} yt_dlp_command={} cookies_configured={} format_configured={} proxy_configured={} enabled_platforms={} max_urls_per_request={} job_timeout_seconds={} download_max_attempts={} download_initial_backoff_ms={} max_download_storage_bytes={} webhook_timeout_seconds={} webhook_connect_timeout_seconds={} webhook_max_attempts={} webhook_initial_backoff_ms={} webhook_signing_enabled={} allow_private_webhook_urls={}",
         config.addr,
         config.workers,
         config.data_dir.display(),
@@ -110,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
         config.cookies_path.is_some(),
         config.format.is_some(),
         config.proxy.is_some(),
+        config.download_enabled_platforms.join(","),
         config.max_urls_per_request,
         config.job_timeout_seconds,
         config.download_max_attempts,
@@ -126,6 +135,12 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    info!("server shutdown requested; stopping download workers");
+    worker_runtime.request_shutdown();
+    cancellations.cancel_all();
+    queue_shutdown.close();
+    worker_runtime.wait().await;
+    info!("download workers stopped");
 
     Ok(())
 }

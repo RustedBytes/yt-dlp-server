@@ -10,6 +10,7 @@ anyhow = "1.0.100"
 askama = "0.14.0"
 async-channel = "2.5.0"
 axum = "0.8.7"
+base64 = "0.22.1"
 clap = { version = "4.5", features = ["derive"] }
 hmac = "0.12.1"
 log = "0.4.28"
@@ -20,6 +21,7 @@ sha2 = "0.10.9"
 thiserror = "2.0.17"
 time = { version = "0.3.44", features = ["formatting", "macros", "parsing", "serde", "serde-well-known"] }
 tokio = { version = "1.48.0", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.17", features = ["io"] }
 toml = "0.8"
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.6.6", features = ["cors", "timeout"] }

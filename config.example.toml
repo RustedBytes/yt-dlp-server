@@ -7,7 +7,8 @@ data_dir = "data"
 cors_allowed_origins = []
 
 # Empty by default, which disables API key authentication.
-# When set, send either `x-api-key: <key>` or `Authorization: Bearer <key>`.
+# When set, send `x-api-key: <key>`, `Authorization: Bearer <key>`, or
+# browser-friendly Basic auth with any username and the API key as the password.
 api_keys = []
 
 # Disabled by default. When greater than 0, applies per-key limits when API keys are configured.
@@ -25,8 +26,25 @@ workers = 1
 output_dir = "data/downloads"
 yt_dlp_command = "uv"
 cookies_path = ""
+cookie_profiles.account_a = ""
 format = ""
 proxy = ""
+
+# Platform IDs accepted by URL validation. Empty disables all platforms.
+# Supported values: tiktok, instagram, youtube, facebook, snapchat, rutube, douyin, likee, vk, yappy.
+enabled_platforms = [
+  "tiktok",
+  "instagram",
+  "youtube",
+  "facebook",
+  "snapchat",
+  "rutube",
+  "douyin",
+  "likee",
+  "vk",
+  "yappy",
+]
+
 max_urls_per_request = 100
 
 # Set to 0 to disable per-job timeout enforcement.
@@ -43,6 +61,17 @@ max_download_storage_bytes = 0
 
 # Set to 0 to disable the free-space preflight check.
 min_free_disk_bytes = 0
+
+# Optional per-platform overrides. Any omitted field falls back to [download].
+# Per-request API `format` still overrides both platform and global format.
+[download.platforms.instagram]
+cookies_path = ""
+format = ""
+proxy = ""
+job_timeout_seconds = 1800
+download_max_attempts = 3
+download_initial_backoff_ms = 1000
+max_concurrent = 1
 
 [retention]
 # Limits how many jobs stay queryable in memory. Set to 0 to retain none.

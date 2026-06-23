@@ -34,14 +34,25 @@ workers = 1
 output_dir = "data/downloads"
 yt_dlp_command = "uv"
 cookies_path = ""
+cookie_profiles.account_a = "account-a-cookies.txt"
 format = ""
 proxy = ""
+enabled_platforms = ["tiktok", "instagram", "youtube", "facebook", "snapchat", "rutube", "douyin", "likee", "vk", "yappy"]
 max_urls_per_request = 100
 job_timeout_seconds = 1800
 download_max_attempts = 3
 download_initial_backoff_ms = 1000
 max_download_storage_bytes = 0
 min_free_disk_bytes = 0
+
+[download.platforms.instagram]
+cookies_path = "instagram-cookies.txt"
+format = "mp4/best"
+proxy = ""
+job_timeout_seconds = 1800
+download_max_attempts = 3
+download_initial_backoff_ms = 1000
+max_concurrent = 1
 
 [webhooks]
 webhook_timeout_seconds = 10
@@ -60,7 +71,7 @@ Environment variables override TOML values when set:
 - `BIND_ADDR`: bind address, default `127.0.0.1:3000`
 - `DATA_DIR`: metadata directory base, default `data`
 - `CORS_ALLOWED_ORIGINS`: comma-separated origins allowed by browser CORS checks
-- `API_KEYS`: comma-separated accepted API keys; empty disables API key authentication
+- `API_KEYS`: comma-separated accepted API keys; empty disables API key authentication. Clients may send `x-api-key`, Bearer auth, or Basic auth with the API key as the password.
 - `RATE_LIMIT_REQUESTS_PER_MINUTE`: per-key request limit when API keys are configured, or shared anonymous limit otherwise; set to `0` to disable rate limiting
 - `QUEUE_SIZE`: queued job capacity
 - `BODY_LIMIT_BYTES`: JSON/form body limit
@@ -71,6 +82,7 @@ Environment variables override TOML values when set:
 - `YT_DLP_COOKIES_PATH`: optional server-side cookie file passed as `--cookies`
 - `YT_DLP_FORMAT`: optional yt-dlp format selector passed as `--format`
 - `YT_DLP_PROXY`: optional proxy URL passed as `--proxy`
+- `DOWNLOAD_ENABLED_PLATFORMS`: comma-separated platform IDs accepted by URL validation; default is `tiktok,instagram,youtube,facebook,snapchat,rutube,douyin,likee,vk,yappy`; an empty value disables all platforms
 - `MAX_URLS_PER_REQUEST`: maximum non-empty URLs accepted in one submission
 - `JOB_TIMEOUT_SECONDS`: per-download timeout; set to `0` to disable timeout enforcement
 - `DOWNLOAD_MAX_ATTEMPTS`: maximum yt-dlp attempts per job, including the first attempt; minimum effective value is `1`
@@ -87,5 +99,9 @@ Environment variables override TOML values when set:
 - `ALLOW_PRIVATE_WEBHOOK_URLS`: set to `true` only in trusted deployments that must call local or private webhook targets
 - `RUST_LOG`: logging level, for example `debug`
 - `CONFIG_PATH`: explicit TOML config path when `--config` is not set
+
+`download.cookie_profiles.<name>` entries define named server-side cookie files that API clients may select by name with `cookie_profile`. Profile names may contain ASCII letters, numbers, dashes, and underscores. The API never accepts raw cookie values.
+
+Per-platform tables under `[download.platforms.<platform-id>]` override the global cookies, format, proxy, timeout, max attempts, and retry backoff for that platform. They may also set `max_concurrent` to cap how many downloads for that platform run at once across all workers. Omit a field to inherit `[download]`; omitting `max_concurrent` leaves that platform limited only by `download.workers`. API request `format` still has highest precedence for that job. API request `cookie_profile` has highest precedence for cookies.
 
 Cookie files are server-side configuration only. API requests cannot submit cookies or credentials.

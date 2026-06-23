@@ -55,5 +55,7 @@ USER downloader
 EXPOSE 3000
 VOLUME ["/app/data"]
 STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:3000/ready >/dev/null || exit 1
 
 ENTRYPOINT ["yt-dlp-server"]

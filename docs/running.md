@@ -14,6 +14,8 @@ cargo run
 
 Default bind address is `127.0.0.1:3000`.
 
+Use Ctrl-C to stop the server. Shutdown closes the queue, signals active downloads to cancel, and waits for workers to exit.
+
 Open the browser UI:
 
 ```bash

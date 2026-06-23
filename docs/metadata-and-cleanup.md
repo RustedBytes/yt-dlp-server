@@ -8,11 +8,13 @@ Runtime metadata is stored as JSON Lines under `data/metadata/`:
 
 On startup, the server reloads these JSONL files so completed job records remain available through `/v1/jobs/{id}` after a restart. Any job that was still `queued` or `running` when the previous process exited is recovered as `failed` and appended to `download_results.jsonl`.
 
+On graceful shutdown, the HTTP server stops accepting requests, the in-process queue is closed, active download attempts are signaled for cancellation, and the process waits for download workers to exit. Any non-terminal job that does not reach a terminal state before process exit is still recovered as `failed` on the next startup.
+
 Successful downloads are retained under `data/downloads/<job-id>/`. Each directory contains the downloaded media file named `<job-id>.<ext>` and the metadata file named `<job-id>.info.json`.
 
 Failed or timed-out downloads remove their partial `data/downloads/<job-id>/` directory on a best-effort basis.
 
-When `download.download_max_attempts` is greater than `1`, failed `yt-dlp` attempts are retried with exponential backoff starting at `download.download_initial_backoff_ms`. Each retry starts from a clean `data/downloads/<job-id>/` directory, so partial files from previous attempts are not retained.
+When `download.download_max_attempts` is greater than `1`, failed `yt-dlp` attempts are retried with exponential backoff starting at `download.download_initial_backoff_ms`. Each retry starts from a clean `data/downloads/<job-id>/` directory, so partial files from previous attempts are not retained. Final job records persist `attempts` and `attempt_errors` for API reads and webhook payloads.
 
 The in-memory job map is bounded by `retention.job_retention_limit`. Metadata compaction at startup is bounded by `retention.metadata_retention_limit`.
 

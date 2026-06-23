@@ -2,22 +2,29 @@ use std::{
     collections::HashMap,
     io::ErrorKind,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, anyhow};
 use async_channel::Receiver;
 use log::{debug, error, info, warn};
-use serde::Serialize;
-use tokio::sync::RwLock;
+use serde::{Deserialize, Serialize};
+use tokio::{
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore},
+    task::JoinHandle,
+};
 use uuid::Uuid;
 
 use crate::{
     config::Config,
-    downloader::download_url,
-    state::{AppMetrics, AppState, WorkerPoolState},
-    types::{DownloadMetadata, JobRecord, JobStatus, QueueResponse},
+    downloader::{DownloadError, DownloadReport, download_url},
+    platforms,
+    state::{AppMetrics, AppState, CancellationRegistry, WorkerPoolState},
+    types::{JobRecord, JobStatus, QueueResponse},
     util::{append_jsonl, hmac_sha256_hex},
 };
 
@@ -25,6 +32,64 @@ use crate::{
 pub struct JobRequest {
     pub id: Uuid,
     pub url: String,
+    pub format: Option<String>,
+    pub cookie_profile: Option<String>,
+}
+
+pub struct WorkerRuntime {
+    shutdown: Arc<AtomicBool>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+#[derive(Clone, Default)]
+struct PlatformConcurrencyLimiter {
+    limits: Arc<HashMap<String, Arc<Semaphore>>>,
+}
+
+impl PlatformConcurrencyLimiter {
+    fn from_config(config: &Config) -> Self {
+        let limits = config
+            .platform_policies
+            .iter()
+            .filter_map(|(platform, policy)| {
+                policy
+                    .max_concurrent
+                    .map(|limit| (platform.clone(), Arc::new(Semaphore::new(limit))))
+            })
+            .collect();
+        Self {
+            limits: Arc::new(limits),
+        }
+    }
+
+    async fn acquire(&self, url: &str) -> Option<OwnedSemaphorePermit> {
+        let platform = platform_for_url(url)?;
+        let semaphore = self.limits.get(platform)?;
+        match Arc::clone(semaphore).acquire_owned().await {
+            Ok(permit) => Some(permit),
+            Err(err) => {
+                warn!(
+                    "platform concurrency limiter closed platform={} error={}",
+                    platform, err
+                );
+                None
+            }
+        }
+    }
+}
+
+impl WorkerRuntime {
+    pub fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    pub async fn wait(self) {
+        for handle in self.handles {
+            if let Err(err) = handle.await {
+                warn!("download worker task join failed error={}", err);
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -90,7 +155,7 @@ impl WebhookClient {
             .post(webhook_url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header("x-download-event-id", event.event_id.to_string())
-            .header("x-download-event-type", event.event_type)
+            .header("x-download-event-type", event.event_type.as_str())
             .header("x-download-delivery-attempt", attempt.to_string())
             .body(body.clone());
         if let Some(secret) = &self.signing_secret {
@@ -121,26 +186,15 @@ impl WebhookClient {
         }
 
         let event = WebhookEvent::from_job(record.clone());
-        let mut last_error = None;
-
-        for attempt in 1..=self.max_attempts {
-            match self.send(&event, attempt).await {
-                Ok(()) => {
-                    return WebhookDeliveryResult::Delivered {
-                        event_id: event.event_id,
-                        attempts: attempt,
-                    };
-                }
-                Err(err) => {
-                    last_error = Some(err.to_string());
-                    if attempt < self.max_attempts && !self.initial_backoff.is_zero() {
-                        tokio::time::sleep(backoff_delay(self.initial_backoff, attempt)).await;
-                    }
-                }
+        let error = match self.replay_event(&event).await {
+            Ok(report) => {
+                return WebhookDeliveryResult::Delivered {
+                    event_id: report.event_id,
+                    attempts: report.attempts,
+                };
             }
-        }
-
-        let error = last_error.unwrap_or_else(|| "webhook delivery failed".to_string());
+            Err(err) => err.to_string(),
+        };
         let dead_letter = WebhookDeadLetter {
             event,
             attempts: self.max_attempts,
@@ -161,35 +215,100 @@ impl WebhookClient {
             },
         }
     }
+
+    pub async fn replay_event(&self, event: &WebhookEvent) -> anyhow::Result<WebhookReplayReport> {
+        if event.job.webhook_url.is_none() {
+            anyhow::bail!("webhook event has no webhook_url");
+        }
+
+        let mut last_error = None;
+        for attempt in 1..=self.max_attempts {
+            match self.send(event, attempt).await {
+                Ok(()) => {
+                    return Ok(WebhookReplayReport {
+                        event_id: event.event_id,
+                        attempts: attempt,
+                    });
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                    if attempt < self.max_attempts && !self.initial_backoff.is_zero() {
+                        tokio::time::sleep(backoff_delay(self.initial_backoff, attempt)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("webhook delivery failed")))
+    }
+
+    pub async fn redeliver_job(&self, record: &JobRecord) -> anyhow::Result<WebhookReplayReport> {
+        let event = WebhookEvent::from_job(record.clone());
+        self.replay_event(&event).await
+    }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookEvent {
     pub event_id: Uuid,
-    pub event_type: &'static str,
+    pub event_type: String,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
     pub job: JobRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_urls: Option<WebhookArtifactUrls>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookArtifactUrls {
+    pub artifacts_url: String,
+    pub media_url: String,
+    pub media_inline_url: String,
+    pub info_json_url: String,
+    pub archive_url: String,
 }
 
 impl WebhookEvent {
     fn from_job(job: JobRecord) -> Self {
+        let artifact_urls = job
+            .result
+            .as_ref()
+            .map(|_| WebhookArtifactUrls::for_job(job.id));
         Self {
             event_id: Uuid::new_v4(),
-            event_type: "job.completed",
+            event_type: "job.completed".to_string(),
             created_at: time::OffsetDateTime::now_utc(),
             job,
+            artifact_urls,
         }
     }
 }
 
-#[derive(Debug, Serialize)]
+impl WebhookArtifactUrls {
+    fn for_job(id: Uuid) -> Self {
+        Self {
+            artifacts_url: format!("/v1/jobs/{id}/artifacts"),
+            media_url: format!("/v1/jobs/{id}/media"),
+            media_inline_url: format!("/v1/jobs/{id}/media-inline"),
+            info_json_url: format!("/v1/jobs/{id}/info-json"),
+            archive_url: format!("/v1/jobs/{id}/archive"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookDeadLetter {
     pub event: WebhookEvent,
     pub attempts: usize,
     #[serde(with = "time::serde::rfc3339")]
     pub failed_at: time::OffsetDateTime,
     pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WebhookReplayReport {
+    pub event_id: Uuid,
+    pub attempts: usize,
 }
 
 enum WebhookDeliveryResult {
@@ -242,6 +361,67 @@ pub async fn load_jobs(config: &Config) -> anyhow::Result<HashMap<Uuid, JobRecor
     retain_recent_jobs(&mut jobs, config.job_retention_limit);
 
     Ok(jobs)
+}
+
+pub async fn load_webhook_dead_letters(path: &Path) -> anyhow::Result<Vec<WebhookDeadLetter>> {
+    let contents = match tokio::fs::read_to_string(path).await {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+
+    let mut dead_letters = Vec::new();
+    for (line_number, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let dead_letter = serde_json::from_str::<WebhookDeadLetter>(line).with_context(|| {
+            format!(
+                "failed to parse webhook dead letter at {}:{}",
+                path.display(),
+                line_number + 1
+            )
+        })?;
+        dead_letters.push(dead_letter);
+    }
+
+    Ok(dead_letters)
+}
+
+pub async fn remove_webhook_dead_letter(path: &Path, event_id: Uuid) -> anyhow::Result<bool> {
+    let dead_letters = load_webhook_dead_letters(path).await?;
+    let original_len = dead_letters.len();
+    let retained = dead_letters
+        .into_iter()
+        .filter(|dead_letter| dead_letter.event.event_id != event_id)
+        .collect::<Vec<_>>();
+    if retained.len() == original_len {
+        return Ok(false);
+    }
+
+    write_webhook_dead_letters(path, &retained).await?;
+    Ok(true)
+}
+
+async fn write_webhook_dead_letters(
+    path: &Path,
+    dead_letters: &[WebhookDeadLetter],
+) -> anyhow::Result<()> {
+    let temp_path = path.with_extension("jsonl.tmp");
+    let mut bytes = Vec::new();
+    for dead_letter in dead_letters {
+        serde_json::to_writer(&mut bytes, dead_letter)?;
+        bytes.push(b'\n');
+    }
+    tokio::fs::write(&temp_path, bytes)
+        .await
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    tokio::fs::rename(&temp_path, path)
+        .await
+        .with_context(|| format!("failed to replace {}", path.display()))?;
+    Ok(())
 }
 
 async fn load_job_records(path: &Path, jobs: &mut HashMap<Uuid, JobRecord>) -> anyhow::Result<()> {
@@ -344,6 +524,8 @@ pub async fn enqueue_record(
     let request = JobRequest {
         id,
         url: record.url.clone(),
+        format: record.format.clone(),
+        cookie_profile: record.cookie_profile.clone(),
     };
 
     if state.queue_tx.is_full() {
@@ -394,6 +576,7 @@ pub async fn enqueue_record(
         id,
         status: JobStatus::Queued,
         status_url: format!("/v1/jobs/{id}"),
+        existing: false,
     })
 }
 
@@ -417,19 +600,33 @@ pub fn start_workers(
     workers: Arc<WorkerPoolState>,
     metrics: Arc<AppMetrics>,
     webhooks: Arc<WebhookClient>,
+    cancellations: Arc<CancellationRegistry>,
     queue_rx: Receiver<JobRequest>,
-) {
+) -> WorkerRuntime {
     info!("starting download worker pool workers={}", config.workers);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let platform_limiter = PlatformConcurrencyLimiter::from_config(&config);
+    let mut handles = Vec::with_capacity(config.workers);
     for worker_id in 0..config.workers {
         let config = Arc::clone(&config);
         let jobs = Arc::clone(&jobs);
         let workers = Arc::clone(&workers);
         let metrics = Arc::clone(&metrics);
         let webhooks = Arc::clone(&webhooks);
+        let cancellations = Arc::clone(&cancellations);
         let queue_rx = queue_rx.clone();
+        let shutdown = Arc::clone(&shutdown);
+        let platform_limiter = platform_limiter.clone();
         workers.mark_ready();
-        tokio::spawn(async move {
+        handles.push(tokio::spawn(async move {
             while let Ok(request) = queue_rx.recv().await {
+                if shutdown.load(Ordering::Relaxed) {
+                    debug!(
+                        "worker stopping before starting queued job worker_id={} job_id={}",
+                        worker_id, request.id
+                    );
+                    break;
+                }
                 let job_span = tracing::info_span!(
                     "download_job",
                     job_id = %request.id,
@@ -441,11 +638,48 @@ pub fn start_workers(
                     "worker received job worker_id={} job_id={} url={}",
                     worker_id, request.id, request.url
                 );
+                let cancel_flag = cancellations.flag_for(request.id);
+                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed)
+                    || is_job_canceled(&jobs, request.id).await
+                {
+                    info!("worker skipping canceled job job_id={}", request.id);
+                    cancellations.remove(request.id);
+                    continue;
+                }
+
+                let _platform_permit = platform_limiter.acquire(&request.url).await;
+                if shutdown.load(Ordering::Relaxed) {
+                    debug!(
+                        "worker stopping after platform concurrency wait worker_id={} job_id={}",
+                        worker_id, request.id
+                    );
+                    break;
+                }
+                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed)
+                    || is_job_canceled(&jobs, request.id).await
+                {
+                    info!(
+                        "worker skipping canceled job after platform concurrency wait job_id={}",
+                        request.id
+                    );
+                    cancellations.remove(request.id);
+                    continue;
+                }
+
                 metrics.record_job_started();
                 let job_started = Instant::now();
+                workers.mark_active(worker_id, request.id, request.url.clone());
                 mark_running(&jobs, request.id).await;
 
-                let result = download_url(&config, request.id, &request.url).await;
+                let result = download_url(
+                    &config,
+                    request.id,
+                    &request.url,
+                    request.format.as_deref(),
+                    request.cookie_profile.as_deref(),
+                    cancel_flag,
+                )
+                .await;
                 let elapsed_ms = job_started.elapsed().as_millis();
                 if is_timeout_error(&result) {
                     metrics.record_job_timed_out(elapsed_ms);
@@ -456,10 +690,22 @@ pub fn start_workers(
                 }
 
                 finish_job(&config, &jobs, &metrics, &webhooks, request.id, result).await;
+                workers.clear_active(worker_id);
+                cancellations.remove(request.id);
             }
+            workers.clear_active(worker_id);
             workers.mark_stopped();
-        });
+        }));
     }
+
+    WorkerRuntime { shutdown, handles }
+}
+
+async fn is_job_canceled(jobs: &RwLock<HashMap<Uuid, JobRecord>>, id: Uuid) -> bool {
+    jobs.read()
+        .await
+        .get(&id)
+        .is_some_and(|record| record.status == JobStatus::Canceled)
 }
 
 async fn mark_running(jobs: &RwLock<HashMap<Uuid, JobRecord>>, id: Uuid) {
@@ -479,7 +725,7 @@ async fn finish_job(
     metrics: &AppMetrics,
     webhooks: &WebhookClient,
     id: Uuid,
-    result: anyhow::Result<DownloadMetadata>,
+    result: Result<DownloadReport, DownloadError>,
 ) {
     let mut final_record = None;
     {
@@ -487,15 +733,23 @@ async fn finish_job(
         if let Some(record) = jobs.get_mut(&id) {
             record.updated_at = time::OffsetDateTime::now_utc();
             match result {
-                Ok(metadata) => {
+                Ok(report) => {
                     record.status = JobStatus::Succeeded;
-                    record.result = Some(metadata);
+                    record.result = Some(report.metadata);
+                    record.attempts = report.attempts;
+                    record.attempt_errors = report.attempt_errors;
                     record.error_kind = None;
                     record.error = None;
                     info!("job succeeded job_id={}", id);
                 }
                 Err(err) => {
-                    record.status = JobStatus::Failed;
+                    record.status = if is_canceled_error(&err) {
+                        JobStatus::Canceled
+                    } else {
+                        JobStatus::Failed
+                    };
+                    record.attempts = err.attempts;
+                    record.attempt_errors = err.attempt_errors.clone();
                     record.error_kind = Some(classify_error(&err.to_string()).to_string());
                     record.error = Some(err.to_string());
                     warn!("job failed job_id={} error={}", id, err);
@@ -579,16 +833,28 @@ fn backoff_delay(initial_backoff: Duration, attempt: usize) -> Duration {
     initial_backoff.saturating_mul(multiplier)
 }
 
-fn is_timeout_error(result: &anyhow::Result<DownloadMetadata>) -> bool {
+fn platform_for_url(url: &str) -> Option<&'static str> {
+    let url = reqwest::Url::parse(url).ok()?;
+    let host = url.host_str()?;
+    platforms::platform_for_host(host)
+}
+
+fn is_timeout_error<T, E: std::fmt::Display>(result: &Result<T, E>) -> bool {
     result
         .as_ref()
         .err()
         .is_some_and(|err| err.to_string().contains("timed out after"))
 }
 
+fn is_canceled_error(error: &DownloadError) -> bool {
+    error.to_string().contains("job canceled")
+}
+
 fn classify_error(error: &str) -> &'static str {
     let normalized = error.to_ascii_lowercase();
-    if normalized.contains("timed out") {
+    if normalized.contains("job canceled") {
+        "canceled"
+    } else if normalized.contains("timed out") {
         "timeout"
     } else if normalized.contains("429")
         || normalized.contains("too many requests")
@@ -730,7 +996,7 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
-    use crate::state::RateLimiter;
+    use crate::{config::PlatformDownloadPolicy, state::RateLimiter, types::DownloadMetadata};
 
     fn test_config() -> Config {
         Config {
@@ -752,8 +1018,11 @@ mod tests {
             rust_log: "info".to_string(),
             yt_dlp_command: "uv".to_string(),
             cookies_path: None,
+            cookie_profiles: Default::default(),
             format: None,
             proxy: None,
+            platform_policies: Default::default(),
+            download_enabled_platforms: crate::platforms::default_enabled_platforms(),
             max_urls_per_request: 100,
             job_timeout_seconds: 300,
             download_max_attempts: 1,
@@ -778,8 +1047,13 @@ mod tests {
             created_at: now,
             updated_at: now,
             url: url.to_string(),
+            url_sha256: None,
             webhook_url: None,
+            format: None,
+            cookie_profile: None,
             result: None,
+            attempts: 0,
+            attempt_errors: Vec::new(),
             error_kind: None,
             error: None,
         }
@@ -795,6 +1069,67 @@ mod tests {
         config.results_jsonl = config.metadata_dir.join("download_results.jsonl");
         config.webhooks_dead_letter_jsonl = config.metadata_dir.join("webhooks_dead_letter.jsonl");
         config
+    }
+
+    #[test]
+    fn webhook_event_includes_stable_artifact_urls_when_job_has_result() {
+        let mut record = job_record("https://www.instagram.com/reel/abc/");
+        record.status = JobStatus::Succeeded;
+        record.result = Some(DownloadMetadata {
+            original_url: record.url.clone(),
+            webpage_url: Some(record.url.clone()),
+            extractor: Some("Instagram".to_string()),
+            title: Some("example".to_string()),
+            uploader: Some("creator".to_string()),
+            duration: Some(12.5),
+            extension: Some("mp4".to_string()),
+            media_path: PathBuf::from(format!("data/downloads/{}/{}.mp4", record.id, record.id)),
+            media_bytes: 5,
+            info_json_path: PathBuf::from(format!(
+                "data/downloads/{}/{}.info.json",
+                record.id, record.id
+            )),
+            yt_dlp_version: "test".to_string(),
+            elapsed_ms: 123,
+        });
+
+        let event = WebhookEvent::from_job(record.clone());
+        let artifact_urls = event.artifact_urls.as_ref().unwrap();
+        let json = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(
+            artifact_urls.artifacts_url,
+            format!("/v1/jobs/{}/artifacts", record.id)
+        );
+        assert_eq!(
+            artifact_urls.media_url,
+            format!("/v1/jobs/{}/media", record.id)
+        );
+        assert_eq!(
+            artifact_urls.media_inline_url,
+            format!("/v1/jobs/{}/media-inline", record.id)
+        );
+        assert_eq!(
+            artifact_urls.info_json_url,
+            format!("/v1/jobs/{}/info-json", record.id)
+        );
+        assert_eq!(
+            artifact_urls.archive_url,
+            format!("/v1/jobs/{}/archive", record.id)
+        );
+        assert_eq!(
+            json["artifact_urls"]["media_url"],
+            format!("/v1/jobs/{}/media", record.id)
+        );
+    }
+
+    #[test]
+    fn webhook_event_omits_artifact_urls_when_job_has_no_result() {
+        let event = WebhookEvent::from_job(job_record("https://www.instagram.com/reel/abc/"));
+        let json = serde_json::to_value(&event).unwrap();
+
+        assert!(event.artifact_urls.is_none());
+        assert!(json.get("artifact_urls").is_none());
     }
 
     #[tokio::test]
@@ -834,6 +1169,8 @@ mod tests {
             .try_send(JobRequest {
                 id: Uuid::new_v4(),
                 url: "https://www.tiktok.com/@busy/video/1".to_string(),
+                format: None,
+                cookie_profile: None,
             })
             .unwrap();
         let state = AppState {
@@ -843,6 +1180,7 @@ mod tests {
             workers: Arc::new(WorkerPoolState::new(1)),
             metrics: Arc::new(AppMetrics::default()),
             rate_limiter: Arc::new(RateLimiter::new(0)),
+            cancellations: Arc::new(CancellationRegistry::default()),
         };
 
         let err = enqueue_record(&state, job_record("https://www.instagram.com/reel/abc/"))
@@ -854,6 +1192,92 @@ mod tests {
 
         drop(queue_rx);
         tokio::fs::remove_dir_all(&config.data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_runtime_shutdown_skips_buffered_jobs() {
+        let config = Arc::new(temp_config("worker-shutdown"));
+        tokio::fs::create_dir_all(&config.metadata_dir)
+            .await
+            .unwrap();
+        let jobs = Arc::new(RwLock::new(HashMap::new()));
+        let workers = Arc::new(WorkerPoolState::new(1));
+        let metrics = Arc::new(AppMetrics::default());
+        let webhooks = Arc::new(WebhookClient::from_config(&config).unwrap());
+        let cancellations = Arc::new(CancellationRegistry::default());
+        let (queue_tx, queue_rx) = bounded(1);
+        let runtime = start_workers(
+            Arc::clone(&config),
+            Arc::clone(&jobs),
+            Arc::clone(&workers),
+            Arc::clone(&metrics),
+            webhooks,
+            cancellations,
+            queue_rx,
+        );
+        let record = job_record("https://www.instagram.com/reel/abc/");
+        jobs.write().await.insert(record.id, record.clone());
+
+        runtime.request_shutdown();
+        queue_tx
+            .try_send(JobRequest {
+                id: record.id,
+                url: record.url.clone(),
+                format: None,
+                cookie_profile: None,
+            })
+            .unwrap();
+        queue_tx.close();
+
+        tokio::time::timeout(Duration::from_secs(1), runtime.wait())
+            .await
+            .unwrap();
+        assert_eq!(workers.snapshot().ready, 0);
+        assert_eq!(metrics.snapshot().jobs_started, 0);
+        assert_eq!(
+            jobs.read().await.get(&record.id).unwrap().status,
+            JobStatus::Queued
+        );
+
+        tokio::fs::remove_dir_all(&config.data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn platform_concurrency_limiter_blocks_same_platform_until_permit_released() {
+        let mut config = test_config();
+        config.platform_policies.insert(
+            "instagram".to_string(),
+            PlatformDownloadPolicy {
+                cookies_path: None,
+                format: None,
+                proxy: None,
+                job_timeout_seconds: None,
+                download_max_attempts: None,
+                download_initial_backoff_ms: None,
+                max_concurrent: Some(1),
+            },
+        );
+        let limiter = PlatformConcurrencyLimiter::from_config(&config);
+
+        let first = limiter
+            .acquire("https://www.instagram.com/reel/abc/")
+            .await
+            .expect("instagram should have a concurrency permit");
+        let second = tokio::time::timeout(
+            Duration::from_millis(25),
+            limiter.acquire("https://www.instagram.com/reel/def/"),
+        )
+        .await;
+        assert!(second.is_err());
+
+        drop(first);
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            limiter.acquire("https://www.instagram.com/reel/def/"),
+        )
+        .await
+        .unwrap();
+        assert!(second.is_some());
     }
 
     #[tokio::test]
@@ -885,7 +1309,7 @@ mod tests {
 
     #[test]
     fn timeout_errors_are_classified() {
-        let result = Err(anyhow!("job timed out after 5 seconds"));
+        let result: Result<(), anyhow::Error> = Err(anyhow!("job timed out after 5 seconds"));
 
         assert!(is_timeout_error(&result));
     }

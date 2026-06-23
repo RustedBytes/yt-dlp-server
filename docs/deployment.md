@@ -20,11 +20,15 @@ workers = 2
 output_dir = "/var/lib/yt-dlp-server/downloads"
 cookies_path = "/etc/yt-dlp-server/cookies.txt"
 format = "bv*+ba/b"
+enabled_platforms = ["tiktok", "instagram", "youtube", "facebook", "snapchat", "rutube", "douyin", "likee", "vk", "yappy"]
 job_timeout_seconds = 1800
 download_max_attempts = 3
 download_initial_backoff_ms = 1000
 max_download_storage_bytes = 107374182400
 min_free_disk_bytes = 1073741824
+
+[download.platforms.instagram]
+max_concurrent = 1
 
 [webhooks]
 webhook_max_attempts = 3

@@ -4,8 +4,8 @@ use anyhow::Context;
 use hmac::{Hmac, Mac};
 use log::{debug, trace};
 use serde::Serialize;
-use sha2::Sha256;
-use tokio::fs;
+use sha2::{Digest, Sha256};
+use tokio::{fs, io::AsyncReadExt};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -53,6 +53,24 @@ pub fn hmac_sha256_hex(secret: &str, bytes: &[u8]) -> String {
         .collect()
 }
 
+pub async fn sha256_file_hex(path: &Path) -> std::io::Result<String> {
+    let mut file = fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -67,6 +85,20 @@ mod tests {
             signature,
             "b82fcb791acec57859b989b430a826488ce2e479fdf92326bd0a2e8375a42ba4"
         );
+    }
+
+    #[tokio::test]
+    async fn hashes_file_as_lowercase_sha256_hex() {
+        let path = temp_path("sha256.bin");
+        fs::write(&path, b"video").await.unwrap();
+
+        let digest = sha256_file_hex(&path).await.unwrap();
+
+        assert_eq!(
+            digest,
+            "0cab1c9617404faf2b24e221e189ca5945813e14d3f766345b09ca13bbe28ffc"
+        );
+        fs::remove_file(path).await.unwrap();
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@ pub enum JobStatus {
     Running,
     Succeeded,
     Failed,
+    Canceled,
     Deleted,
 }
 
@@ -21,18 +22,30 @@ impl fmt::Display for JobStatus {
             Self::Running => "running",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
+            Self::Canceled => "canceled",
             Self::Deleted => "deleted",
         })
     }
 }
 
 impl JobStatus {
+    pub fn is_cancelable(&self) -> bool {
+        matches!(self, Self::Queued | Self::Running)
+    }
+
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed)
+        matches!(self, Self::Succeeded | Self::Failed | Self::Canceled)
     }
 
     pub fn is_deletable(&self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed)
+        matches!(self, Self::Succeeded | Self::Failed | Self::Canceled)
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Canceled | Self::Deleted
+        )
     }
 }
 
@@ -45,11 +58,30 @@ pub struct JobRecord {
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_sha256: Option<String>,
     pub webhook_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cookie_profile: Option<String>,
     pub result: Option<DownloadMetadata>,
+    #[serde(default)]
+    pub attempts: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempt_errors: Vec<DownloadAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadAttempt {
+    pub attempt: usize,
+    pub error: String,
+    pub elapsed_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_backoff_ms: Option<u128>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +105,8 @@ pub struct QueueResponse {
     pub id: Uuid,
     pub status: JobStatus,
     pub status_url: String,
+    #[serde(default)]
+    pub existing: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

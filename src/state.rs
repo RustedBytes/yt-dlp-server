@@ -2,12 +2,13 @@ use std::{
     collections::{HashMap, hash_map::Entry},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use async_channel::Sender;
+use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -21,6 +22,7 @@ pub struct AppState {
     pub workers: Arc<WorkerPoolState>,
     pub metrics: Arc<AppMetrics>,
     pub rate_limiter: Arc<RateLimiter>,
+    pub cancellations: Arc<CancellationRegistry>,
 }
 
 #[derive(Debug)]
@@ -28,6 +30,7 @@ pub struct WorkerPoolState {
     expected: usize,
     ready: AtomicUsize,
     failed: AtomicUsize,
+    active: Mutex<HashMap<usize, WorkerActivity>>,
 }
 
 #[derive(Debug, Default)]
@@ -67,10 +70,24 @@ pub struct WorkerPoolSnapshot {
     pub failed: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkerActivitySnapshot {
+    pub worker_id: usize,
+    pub job_id: Uuid,
+    pub url: String,
+    pub started_at: OffsetDateTime,
+    pub elapsed_ms: u128,
+}
+
 #[derive(Debug)]
 pub struct RateLimiter {
     limit_per_minute: u64,
     windows: Mutex<HashMap<String, RateLimitWindow>>,
+}
+
+#[derive(Debug, Default)]
+pub struct CancellationRegistry {
+    flags: Mutex<HashMap<Uuid, Arc<AtomicBool>>>,
 }
 
 #[derive(Debug)]
@@ -79,12 +96,21 @@ struct RateLimitWindow {
     count: u64,
 }
 
+#[derive(Debug, Clone)]
+struct WorkerActivity {
+    job_id: Uuid,
+    url: String,
+    started_at: OffsetDateTime,
+    started_instant: Instant,
+}
+
 impl WorkerPoolState {
     pub fn new(expected: usize) -> Self {
         Self {
             expected,
             ready: AtomicUsize::new(0),
             failed: AtomicUsize::new(0),
+            active: Mutex::new(HashMap::new()),
         }
     }
 
@@ -98,6 +124,49 @@ impl WorkerPoolState {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |ready| {
                 ready.checked_sub(1)
             });
+    }
+
+    pub fn mark_active(&self, worker_id: usize, job_id: Uuid, url: String) {
+        let mut active = self
+            .active
+            .lock()
+            .expect("worker activity mutex should not be poisoned");
+        active.insert(
+            worker_id,
+            WorkerActivity {
+                job_id,
+                url,
+                started_at: OffsetDateTime::now_utc(),
+                started_instant: Instant::now(),
+            },
+        );
+    }
+
+    pub fn clear_active(&self, worker_id: usize) {
+        let mut active = self
+            .active
+            .lock()
+            .expect("worker activity mutex should not be poisoned");
+        active.remove(&worker_id);
+    }
+
+    pub fn active_snapshot(&self) -> Vec<WorkerActivitySnapshot> {
+        let active = self
+            .active
+            .lock()
+            .expect("worker activity mutex should not be poisoned");
+        let mut snapshot = active
+            .iter()
+            .map(|(worker_id, activity)| WorkerActivitySnapshot {
+                worker_id: *worker_id,
+                job_id: activity.job_id,
+                url: activity.url.clone(),
+                started_at: activity.started_at,
+                elapsed_ms: activity.started_instant.elapsed().as_millis(),
+            })
+            .collect::<Vec<_>>();
+        snapshot.sort_by_key(|activity| activity.worker_id);
+        snapshot
     }
 
     pub fn snapshot(&self) -> WorkerPoolSnapshot {
@@ -155,6 +224,41 @@ impl RateLimiter {
 
         state.count += 1;
         RateLimitDecision::Allowed
+    }
+}
+
+impl CancellationRegistry {
+    pub fn flag_for(&self, id: Uuid) -> Arc<AtomicBool> {
+        let mut flags = self
+            .flags
+            .lock()
+            .expect("cancellation registry mutex should not be poisoned");
+        flags
+            .entry(id)
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
+    }
+
+    pub fn cancel(&self, id: Uuid) {
+        self.flag_for(id).store(true, Ordering::Relaxed);
+    }
+
+    pub fn cancel_all(&self) {
+        let flags = self
+            .flags
+            .lock()
+            .expect("cancellation registry mutex should not be poisoned");
+        for flag in flags.values() {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn remove(&self, id: Uuid) {
+        let mut flags = self
+            .flags
+            .lock()
+            .expect("cancellation registry mutex should not be poisoned");
+        flags.remove(&id);
     }
 }
 
@@ -251,5 +355,51 @@ mod tests {
             }
         ));
         assert_eq!(limiter.check("b"), RateLimitDecision::Allowed);
+    }
+
+    #[test]
+    fn cancellation_registry_can_cancel_all_active_flags() {
+        let registry = CancellationRegistry::default();
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let first_flag = registry.flag_for(first);
+        let second_flag = registry.flag_for(second);
+
+        registry.cancel_all();
+
+        assert!(first_flag.load(Ordering::Relaxed));
+        assert!(second_flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn worker_activity_snapshot_reports_active_jobs_in_worker_order() {
+        let workers = WorkerPoolState::new(2);
+        let later_id = uuid::Uuid::new_v4();
+        let first_id = uuid::Uuid::new_v4();
+
+        workers.mark_active(
+            1,
+            later_id,
+            "https://www.tiktok.com/@user/video/2".to_string(),
+        );
+        workers.mark_active(
+            0,
+            first_id,
+            "https://www.instagram.com/reel/abc/".to_string(),
+        );
+
+        let active = workers.active_snapshot();
+
+        assert_eq!(active.len(), 2);
+        assert_eq!(active[0].worker_id, 0);
+        assert_eq!(active[0].job_id, first_id);
+        assert_eq!(active[1].worker_id, 1);
+        assert_eq!(active[1].job_id, later_id);
+
+        workers.clear_active(0);
+
+        let active = workers.active_snapshot();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].worker_id, 1);
     }
 }

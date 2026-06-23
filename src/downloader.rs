@@ -2,16 +2,41 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, anyhow};
 use log::{debug, warn};
 use serde_json::Value;
-use tokio::{fs, process::Command};
+use tokio::{fs, io::AsyncReadExt, process::Command, task::JoinHandle};
 use uuid::Uuid;
 
-use crate::{config::Config, types::DownloadMetadata};
+use crate::{
+    config::{Config, EffectiveDownloadPolicy},
+    types::{DownloadAttempt, DownloadMetadata},
+};
+
+#[derive(Debug)]
+pub struct DownloadReport {
+    pub metadata: DownloadMetadata,
+    pub attempts: usize,
+    pub attempt_errors: Vec<DownloadAttempt>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+pub struct DownloadError {
+    pub attempts: usize,
+    pub attempt_errors: Vec<DownloadAttempt>,
+    #[source]
+    source: anyhow::Error,
+}
+
+pub type DownloadResult = Result<DownloadReport, DownloadError>;
 
 pub async fn check_downloader(config: &Config) -> anyhow::Result<String> {
     yt_dlp_version(config).await
@@ -21,13 +46,18 @@ pub async fn download_url(
     config: &Config,
     id: uuid::Uuid,
     url: &str,
-) -> anyhow::Result<DownloadMetadata> {
+    format: Option<&str>,
+    cookie_profile: Option<&str>,
+    cancel_flag: Arc<AtomicBool>,
+) -> DownloadResult {
     let started = Instant::now();
     let job_dir = config.downloads_dir.join(id.to_string());
-    prepare_download_dir(&job_dir).await?;
+    if let Err(err) = prepare_download_dir(&job_dir).await {
+        return Err(download_error(err, 0, Vec::new()));
+    }
     if let Err(err) = ensure_min_free_disk_space(config).await {
         cleanup_partial_download(&job_dir).await;
-        return Err(err);
+        return Err(download_error(err, 0, Vec::new()));
     }
 
     let version = yt_dlp_version(config).await.unwrap_or_else(|err| {
@@ -38,11 +68,33 @@ pub async fn download_url(
         "unknown".to_string()
     });
 
-    let attempts = config.download_max_attempts.max(1);
+    let policy = config.effective_download_policy(url, cookie_profile);
+    let attempts = policy.download_max_attempts.max(1);
     let mut last_error = None;
+    let mut attempt_errors = Vec::new();
     for attempt in 1..=attempts {
-        prepare_download_dir(&job_dir).await?;
-        let outcome = match run_yt_dlp(config, id, &job_dir, url).await {
+        if let Err(err) = prepare_download_dir(&job_dir).await {
+            return Err(download_error(err, attempt - 1, attempt_errors));
+        }
+        let attempt_started = Instant::now();
+        if cancel_flag.load(Ordering::Relaxed) {
+            return Err(download_error(
+                anyhow!("job canceled before download attempt"),
+                attempt - 1,
+                attempt_errors,
+            ));
+        }
+        let outcome = match run_yt_dlp(
+            config,
+            id,
+            &job_dir,
+            url,
+            format,
+            cookie_profile,
+            Arc::clone(&cancel_flag),
+        )
+        .await
+        {
             Ok(()) => {
                 metadata_from_download_dir(
                     &job_dir,
@@ -56,15 +108,28 @@ pub async fn download_url(
         };
 
         match outcome {
-            Ok(metadata) => return Ok(metadata),
+            Ok(metadata) => {
+                return Ok(DownloadReport {
+                    metadata,
+                    attempts: attempt,
+                    attempt_errors,
+                });
+            }
             Err(err) => {
                 cleanup_partial_download(&job_dir).await;
                 let error = err.to_string();
                 last_error = Some(err);
-                if attempt == attempts {
+                let retry_backoff = (attempt < attempts)
+                    .then(|| retry_backoff(policy.download_initial_backoff_ms, attempt));
+                attempt_errors.push(DownloadAttempt {
+                    attempt,
+                    error: error.clone(),
+                    elapsed_ms: attempt_started.elapsed().as_millis(),
+                    retry_backoff_ms: retry_backoff.map(|delay| delay.as_millis()),
+                });
+                let Some(delay) = retry_backoff else {
                     break;
-                }
-                let delay = retry_backoff(config.download_initial_backoff_ms, attempt);
+                };
                 warn!(
                     "download attempt failed job_id={} attempt={} max_attempts={} retry_backoff_ms={} error={}",
                     id,
@@ -73,14 +138,34 @@ pub async fn download_url(
                     delay.as_millis(),
                     error
                 );
-                if !delay.is_zero() {
-                    tokio::time::sleep(delay).await;
+                if !delay.is_zero() && sleep_or_cancel(delay, &cancel_flag).await {
+                    return Err(download_error(
+                        anyhow!("job canceled during retry backoff"),
+                        attempt,
+                        attempt_errors,
+                    ));
                 }
             }
         }
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow!("download failed without running an attempt")))
+    Err(download_error(
+        last_error.unwrap_or_else(|| anyhow!("download failed without running an attempt")),
+        attempts,
+        attempt_errors,
+    ))
+}
+
+fn download_error(
+    source: anyhow::Error,
+    attempts: usize,
+    attempt_errors: Vec<DownloadAttempt>,
+) -> DownloadError {
+    DownloadError {
+        attempts,
+        attempt_errors,
+        source,
+    }
 }
 
 async fn prepare_download_dir(job_dir: &Path) -> anyhow::Result<()> {
@@ -106,11 +191,37 @@ fn retry_backoff(initial_backoff_ms: u64, failed_attempt: usize) -> Duration {
     Duration::from_millis(initial_backoff_ms.saturating_mul(multiplier))
 }
 
+async fn sleep_or_cancel(delay: Duration, cancel_flag: &AtomicBool) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < delay {
+        if cancel_flag.load(Ordering::Relaxed) {
+            return true;
+        }
+        let remaining = delay.saturating_sub(started.elapsed());
+        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+    }
+    cancel_flag.load(Ordering::Relaxed)
+}
+
 pub fn download_command_args(
     config: &Config,
     id: Uuid,
     job_dir: &Path,
     url: &str,
+    format: Option<&str>,
+    cookie_profile: Option<&str>,
+) -> Vec<OsString> {
+    let policy = config.effective_download_policy(url, cookie_profile);
+    download_command_args_with_policy(config, &policy, id, job_dir, url, format)
+}
+
+fn download_command_args_with_policy(
+    config: &Config,
+    policy: &EffectiveDownloadPolicy,
+    id: Uuid,
+    job_dir: &Path,
+    url: &str,
+    format: Option<&str>,
 ) -> Vec<OsString> {
     let mut args = yt_dlp_prefix_args(config);
     args.extend([
@@ -123,15 +234,15 @@ pub fn download_command_args(
         OsString::from("-o"),
         OsString::from(format!("{id}.%(ext)s")),
     ]);
-    if let Some(cookies_path) = &config.cookies_path {
+    if let Some(cookies_path) = &policy.cookies_path {
         args.push(OsString::from("--cookies"));
         args.push(cookies_path.as_os_str().to_os_string());
     }
-    if let Some(format) = &config.format {
+    if let Some(format) = format.or(policy.format.as_deref()) {
         args.push(OsString::from("--format"));
         args.push(OsString::from(format));
     }
-    if let Some(proxy) = &config.proxy {
+    if let Some(proxy) = &policy.proxy {
         args.push(OsString::from("--proxy"));
         args.push(OsString::from(proxy));
     }
@@ -145,11 +256,21 @@ pub fn version_command_args(config: &Config) -> Vec<OsString> {
     args
 }
 
-async fn run_yt_dlp(config: &Config, id: Uuid, job_dir: &Path, url: &str) -> anyhow::Result<()> {
+async fn run_yt_dlp(
+    config: &Config,
+    id: Uuid,
+    job_dir: &Path,
+    url: &str,
+    format: Option<&str>,
+    cookie_profile: Option<&str>,
+    cancel_flag: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    let policy = config.effective_download_policy(url, cookie_profile);
     let output = run_command_with_timeout(
         &config.yt_dlp_command,
-        download_command_args(config, id, job_dir, url),
-        config.job_timeout_seconds,
+        download_command_args(config, id, job_dir, url, format, cookie_profile),
+        policy.job_timeout_seconds,
+        cancel_flag,
     )
     .await?;
 
@@ -171,8 +292,13 @@ async fn run_yt_dlp(config: &Config, id: Uuid, job_dir: &Path, url: &str) -> any
 }
 
 async fn yt_dlp_version(config: &Config) -> anyhow::Result<String> {
-    let output =
-        run_command_with_timeout(&config.yt_dlp_command, version_command_args(config), 30).await?;
+    let output = run_command_with_timeout(
+        &config.yt_dlp_command,
+        version_command_args(config),
+        30,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await?;
     if !output.status.success() {
         return Err(anyhow!(
             "yt-dlp --version failed with status {}: {}",
@@ -187,8 +313,9 @@ async fn run_command_with_timeout(
     command: &str,
     args: Vec<OsString>,
     timeout_seconds: u64,
+    cancel_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<std::process::Output> {
-    let child = Command::new(command)
+    let mut child = Command::new(command)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -197,21 +324,60 @@ async fn run_command_with_timeout(
         .spawn()
         .with_context(|| format!("failed to spawn `{command}`"))?;
 
-    if timeout_seconds == 0 {
-        return child
-            .wait_with_output()
-            .await
-            .with_context(|| format!("failed to wait for `{command}`"));
-    }
+    let stdout = child.stdout.take().map(read_pipe);
+    let stderr = child.stderr.take().map(read_pipe);
+    let started = Instant::now();
 
-    match tokio::time::timeout(
-        Duration::from_secs(timeout_seconds),
-        child.wait_with_output(),
-    )
-    .await
-    {
-        Ok(output) => output.with_context(|| format!("failed to wait for `{command}`")),
-        Err(_) => Err(anyhow!("job timed out after {timeout_seconds} seconds")),
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("failed to poll `{command}`"))?
+        {
+            break status;
+        }
+        if timeout_seconds > 0 && started.elapsed() >= Duration::from_secs(timeout_seconds) {
+            kill_child(&mut child).await;
+            drain_pipe(stdout).await;
+            drain_pipe(stderr).await;
+            return Err(anyhow!("job timed out after {timeout_seconds} seconds"));
+        }
+        if cancel_flag.load(Ordering::Relaxed) {
+            kill_child(&mut child).await;
+            drain_pipe(stdout).await;
+            drain_pipe(stderr).await;
+            return Err(anyhow!("job canceled by request"));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    Ok(std::process::Output {
+        status,
+        stdout: drain_pipe(stdout).await,
+        stderr: drain_pipe(stderr).await,
+    })
+}
+
+fn read_pipe<T>(mut pipe: T) -> JoinHandle<Vec<u8>>
+where
+    T: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes).await;
+        bytes
+    })
+}
+
+async fn drain_pipe(handle: Option<JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    match handle {
+        Some(handle) => handle.await.unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+async fn kill_child(child: &mut tokio::process::Child) {
+    if let Err(err) = child.kill().await {
+        debug!("failed to kill child process error={}", err);
     }
 }
 
@@ -429,6 +595,8 @@ mod tests {
             id,
             Path::new("data/downloads/job"),
             "https://www.tiktok.com/@user/video/123",
+            None,
+            None,
         )
         .into_iter()
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -459,6 +627,8 @@ mod tests {
             id,
             Path::new("data/downloads/job"),
             "https://www.instagram.com/reel/abc/",
+            None,
+            None,
         )
         .into_iter()
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -467,6 +637,120 @@ mod tests {
         assert_eq!(args.first().unwrap(), "--no-config");
         assert!(args.contains(&format!("{id}.%(ext)s")));
         assert!(!args.contains(&"--cookies".to_string()));
+    }
+
+    #[test]
+    fn download_command_uses_job_format_before_config_format() {
+        let mut config = test_config();
+        config.format = Some("bestvideo+bestaudio/best".to_string());
+        let id = Uuid::parse_str("10af7128-4b98-4e19-a494-17a3d5597e2c").unwrap();
+
+        let args = download_command_args(
+            &config,
+            id,
+            Path::new("data/downloads/job"),
+            "https://www.youtube.com/shorts/abcdefghijk",
+            Some("mp4/best"),
+            None,
+        )
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+        let format_index = args
+            .iter()
+            .position(|arg| arg == "--format")
+            .expect("format flag should be present");
+        assert_eq!(
+            args.get(format_index + 1).map(String::as_str),
+            Some("mp4/best")
+        );
+    }
+
+    #[test]
+    fn download_command_uses_platform_policy_before_global_config() {
+        let mut config = test_config();
+        config.cookies_path = Some(PathBuf::from("global-cookies.txt"));
+        config.format = Some("global-format".to_string());
+        config.proxy = Some("http://global-proxy".to_string());
+        config.platform_policies.insert(
+            "instagram".to_string(),
+            crate::config::PlatformDownloadPolicy {
+                cookies_path: Some(PathBuf::from("instagram-cookies.txt")),
+                format: Some("instagram-format".to_string()),
+                proxy: Some("http://instagram-proxy".to_string()),
+                job_timeout_seconds: Some(90),
+                download_max_attempts: Some(6),
+                download_initial_backoff_ms: Some(750),
+                max_concurrent: None,
+            },
+        );
+        let id = Uuid::parse_str("10af7128-4b98-4e19-a494-17a3d5597e2c").unwrap();
+
+        let args = download_command_args(
+            &config,
+            id,
+            Path::new("data/downloads/job"),
+            "https://www.instagram.com/reel/abc/",
+            Some("request-format"),
+            None,
+        )
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+        assert!(args.contains(&"instagram-cookies.txt".to_string()));
+        assert!(!args.contains(&"global-cookies.txt".to_string()));
+        assert!(args.contains(&"request-format".to_string()));
+        assert!(!args.contains(&"instagram-format".to_string()));
+        assert!(args.contains(&"http://instagram-proxy".to_string()));
+        assert!(!args.contains(&"http://global-proxy".to_string()));
+    }
+
+    #[test]
+    fn download_command_uses_cookie_profile_before_platform_policy() {
+        let mut config = test_config();
+        config.cookies_path = Some(PathBuf::from("global-cookies.txt"));
+        config.cookie_profiles.insert(
+            "account_a".to_string(),
+            PathBuf::from("account-a-cookies.txt"),
+        );
+        config.platform_policies.insert(
+            "instagram".to_string(),
+            crate::config::PlatformDownloadPolicy {
+                cookies_path: Some(PathBuf::from("instagram-cookies.txt")),
+                format: None,
+                proxy: None,
+                job_timeout_seconds: None,
+                download_max_attempts: None,
+                download_initial_backoff_ms: None,
+                max_concurrent: None,
+            },
+        );
+        let id = Uuid::parse_str("10af7128-4b98-4e19-a494-17a3d5597e2c").unwrap();
+
+        let args = download_command_args(
+            &config,
+            id,
+            Path::new("data/downloads/job"),
+            "https://www.instagram.com/reel/abc/",
+            None,
+            Some("account_a"),
+        )
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+        assert!(args.contains(&"account-a-cookies.txt".to_string()));
+        assert!(!args.contains(&"instagram-cookies.txt".to_string()));
+        assert!(!args.contains(&"global-cookies.txt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn retry_backoff_sleep_returns_when_canceled() {
+        let cancel_flag = AtomicBool::new(true);
+
+        assert!(sleep_or_cancel(Duration::from_secs(60), &cancel_flag).await);
     }
 
     #[tokio::test]
@@ -541,10 +825,20 @@ JSON
         config.downloads_dir = root.join("downloads");
         let id = Uuid::parse_str("10af7128-4b98-4e19-a494-17a3d5597e2c").unwrap();
 
-        let metadata = download_url(&config, id, "https://www.youtube.com/shorts/abc")
-            .await
-            .unwrap();
+        let report = download_url(
+            &config,
+            id,
+            "https://www.youtube.com/shorts/abc",
+            None,
+            None,
+            cancel_flag(),
+        )
+        .await
+        .unwrap();
+        let metadata = report.metadata;
 
+        assert_eq!(report.attempts, 1);
+        assert!(report.attempt_errors.is_empty());
         assert_eq!(metadata.yt_dlp_version, "fake-yt-dlp");
         assert_eq!(
             metadata.media_path,
@@ -618,10 +912,22 @@ JSON
         config.download_initial_backoff_ms = 0;
         let id = Uuid::new_v4();
 
-        let metadata = download_url(&config, id, "https://www.youtube.com/shorts/abc")
-            .await
-            .unwrap();
+        let report = download_url(
+            &config,
+            id,
+            "https://www.youtube.com/shorts/abc",
+            None,
+            None,
+            cancel_flag(),
+        )
+        .await
+        .unwrap();
+        let metadata = report.metadata;
 
+        assert_eq!(report.attempts, 2);
+        assert_eq!(report.attempt_errors.len(), 1);
+        assert_eq!(report.attempt_errors[0].attempt, 1);
+        assert_eq!(report.attempt_errors[0].retry_backoff_ms, Some(0));
         assert_eq!(fs::read_to_string(counter).await.unwrap(), "2");
         assert_eq!(metadata.media_bytes, 5);
         assert!(!metadata.media_path.with_file_name("partial.part").exists());
@@ -661,9 +967,16 @@ exit 7
         config.downloads_dir = root.join("downloads");
         let id = Uuid::new_v4();
 
-        let err = download_url(&config, id, "https://www.youtube.com/shorts/abc")
-            .await
-            .unwrap_err();
+        let err = download_url(
+            &config,
+            id,
+            "https://www.youtube.com/shorts/abc",
+            None,
+            None,
+            cancel_flag(),
+        )
+        .await
+        .unwrap_err();
 
         assert!(err.to_string().contains("yt-dlp failed"));
         assert!(!config.downloads_dir.join(id.to_string()).exists());
@@ -703,12 +1016,74 @@ sleep 5
         config.job_timeout_seconds = 1;
         let id = Uuid::new_v4();
 
-        let err = download_url(&config, id, "https://www.youtube.com/shorts/abc")
-            .await
-            .unwrap_err();
+        let err = download_url(
+            &config,
+            id,
+            "https://www.youtube.com/shorts/abc",
+            None,
+            None,
+            cancel_flag(),
+        )
+        .await
+        .unwrap_err();
 
         assert!(err.to_string().contains("timed out"));
         assert!(!config.downloads_dir.join(id.to_string()).exists());
+
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_url_kills_child_process_on_cancel() {
+        let root = temp_dir("fake-cancel");
+        fs::create_dir_all(&root).await.unwrap();
+        let command = fake_yt_dlp(
+            &root,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo fake-yt-dlp
+  exit 0
+fi
+dir=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--paths" ]; then
+    shift
+    dir="${1#home:}"
+  fi
+  shift
+done
+mkdir -p "$dir"
+printf partial > "$dir/partial.part"
+while :; do :; done
+"#,
+        )
+        .await;
+        let mut config = test_config();
+        config.yt_dlp_command = command.to_string_lossy().into_owned();
+        config.downloads_dir = root.join("downloads");
+        config.job_timeout_seconds = 30;
+        let id = Uuid::new_v4();
+        let cancel_flag = cancel_flag();
+        let cancel_task_flag = Arc::clone(&cancel_flag);
+
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            cancel_task_flag.store(true, Ordering::Relaxed);
+        });
+        let err = download_url(
+            &config,
+            id,
+            "https://www.youtube.com/shorts/abc",
+            None,
+            None,
+            cancel_flag,
+        )
+        .await
+        .unwrap_err();
+        cancel_task.await.unwrap();
+
+        assert!(err.to_string().contains("job canceled"));
 
         fs::remove_dir_all(root).await.unwrap();
     }
@@ -735,9 +1110,16 @@ exit 0
         config.min_free_disk_bytes = u64::MAX;
         let id = Uuid::new_v4();
 
-        let err = download_url(&config, id, "https://www.youtube.com/shorts/abc")
-            .await
-            .unwrap_err();
+        let err = download_url(
+            &config,
+            id,
+            "https://www.youtube.com/shorts/abc",
+            None,
+            None,
+            cancel_flag(),
+        )
+        .await
+        .unwrap_err();
 
         assert!(err.to_string().contains("insufficient free disk space"));
         assert!(!config.downloads_dir.join(id.to_string()).exists());
@@ -765,8 +1147,11 @@ exit 0
             rust_log: "info".to_string(),
             yt_dlp_command: "uv".to_string(),
             cookies_path: None,
+            cookie_profiles: Default::default(),
             format: None,
             proxy: None,
+            platform_policies: Default::default(),
+            download_enabled_platforms: crate::platforms::default_enabled_platforms(),
             max_urls_per_request: 100,
             job_timeout_seconds: 300,
             download_max_attempts: 1,
@@ -781,6 +1166,10 @@ exit 0
             webhooks_dead_letter_jsonl: PathBuf::from("data/metadata/webhooks_dead_letter.jsonl"),
             allow_private_webhook_urls: false,
         }
+    }
+
+    fn cancel_flag() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
     }
 
     fn temp_dir(name: &str) -> PathBuf {
