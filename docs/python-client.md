@@ -13,7 +13,8 @@ Queue downloads:
 ```bash
 python3 examples/python_client.py submit \
   https://www.tiktok.com/@user/video/123 \
-  https://www.instagram.com/reel/ABC/
+  https://www.instagram.com/reel/ABC/ \
+  https://www.youtube.com/shorts/XYZ
 ```
 
 Queue from a text file with one URL per line:

@@ -44,7 +44,8 @@ curl -s -X POST http://127.0.0.1:3000/v1/downloads \
   -d '{
     "urls": [
       "https://www.tiktok.com/@user/video/123",
-      "https://www.instagram.com/reel/ABC/"
+      "https://www.instagram.com/reel/ABC/",
+      "https://www.youtube.com/shorts/XYZ"
     ],
     "webhook_url": "https://example.com/download-webhook"
   }'

@@ -2,7 +2,7 @@
 
 [![Rust](https://github.com/RustedBytes/yt-dlp-server/actions/workflows/rust.yml/badge.svg)](https://github.com/RustedBytes/yt-dlp-server/actions/workflows/rust.yml)
 
-Minimal Axum server for queueing TikTok and Instagram video downloads with `yt-dlp` through `uv`.
+Minimal Axum server for queueing short-form social video downloads with `yt-dlp` through `uv`.
 
 ## Documentation
 

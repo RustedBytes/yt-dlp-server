@@ -107,12 +107,12 @@ use crate::types::QueueResponse;
 <body>
   <main>
     <h1>Social Video Downloader</h1>
-    <p>Paste TikTok or Instagram video URLs and queue them for download.</p>
+    <p>Paste short-form social video URLs and queue them for download.</p>
 
     <form method="post" action="/downloads-form">
       <div>
         <label for="urls">URLs</label>
-        <textarea id="urls" name="urls" placeholder="https://www.tiktok.com/@user/video/123&#10;https://www.instagram.com/reel/ABC/" required></textarea>
+        <textarea id="urls" name="urls" placeholder="https://www.tiktok.com/@user/video/123&#10;https://www.instagram.com/reel/ABC/&#10;https://www.youtube.com/shorts/XYZ" required></textarea>
       </div>
 
       <div>

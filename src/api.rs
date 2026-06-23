@@ -514,17 +514,28 @@ fn validate_download_url(value: &str) -> Result<String, ApiError> {
         .to_ascii_lowercase();
     if !is_supported_social_host(&host) {
         return Err(ApiError::BadRequest(format!(
-            "unsupported URL host `{host}`; expected TikTok or Instagram"
+            "unsupported URL host `{host}`; expected a supported social video platform"
         )));
     }
     Ok(url.to_string())
 }
 
 fn is_supported_social_host(host: &str) -> bool {
-    host == "tiktok.com"
-        || host.ends_with(".tiktok.com")
-        || host == "instagram.com"
-        || host.ends_with(".instagram.com")
+    const SUPPORTED_HOSTS: &[&str] = &[
+        "tiktok.com",
+        "instagram.com",
+        "youtube.com",
+        "youtu.be",
+        "facebook.com",
+        "fb.watch",
+        "snapchat.com",
+        "x.com",
+        "twitter.com",
+    ];
+
+    SUPPORTED_HOSTS
+        .iter()
+        .any(|supported| host == *supported || host.ends_with(&format!(".{supported}")))
 }
 
 fn validate_webhook_url(
@@ -657,7 +668,7 @@ fn openapi_document() -> Value {
             },
             "/v1/downloads": {
                 "post": {
-                    "summary": "Queue TikTok or Instagram video downloads",
+                    "summary": "Queue social video downloads",
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -766,14 +777,28 @@ mod tests {
                 " https://www.tiktok.com/@user/video/123 ".to_string(),
                 "https://www.tiktok.com/@user/video/123".to_string(),
                 "https://www.instagram.com/reel/abc/".to_string(),
+                "https://www.youtube.com/shorts/abc".to_string(),
+                "https://youtu.be/abc".to_string(),
+                "https://www.facebook.com/reel/123".to_string(),
+                "https://fb.watch/abc/".to_string(),
+                "https://www.snapchat.com/spotlight/abc".to_string(),
+                "https://x.com/user/status/123".to_string(),
+                "https://twitter.com/user/status/123".to_string(),
             ],
             10,
         )
         .unwrap();
 
-        assert_eq!(urls.len(), 2);
+        assert_eq!(urls.len(), 9);
         assert_eq!(urls[0], "https://www.tiktok.com/@user/video/123");
         assert_eq!(urls[1], "https://www.instagram.com/reel/abc/");
+        assert_eq!(urls[2], "https://www.youtube.com/shorts/abc");
+        assert_eq!(urls[3], "https://youtu.be/abc");
+        assert_eq!(urls[4], "https://www.facebook.com/reel/123");
+        assert_eq!(urls[5], "https://fb.watch/abc/");
+        assert_eq!(urls[6], "https://www.snapchat.com/spotlight/abc");
+        assert_eq!(urls[7], "https://x.com/user/status/123");
+        assert_eq!(urls[8], "https://twitter.com/user/status/123");
     }
 
     #[test]
