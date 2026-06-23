@@ -54,7 +54,7 @@ use crate::{
         BatchQueueResponse, DeleteJobResponse, ErrorResponse, HealthResponse, JobListResponse,
         JobRecord, JobStatus, MetricsResponse, QueueResponse, ReadinessResponse, WorkerHealth,
     },
-    util::{append_jsonl, sha256_file_hex},
+    util::{append_jsonl, hex_lower, sha256_file_hex, sha256_hex},
 };
 
 const MAX_BATCH_JOB_ACTIONS: usize = 500;
@@ -964,7 +964,7 @@ async fn reusable_successful_job(
     cookie_profile: &Option<String>,
 ) -> Option<QueueResponse> {
     let url_sha256 = download_url_sha256(url);
-    let mut matches = state
+    state
         .jobs
         .read()
         .await
@@ -973,33 +973,28 @@ async fn reusable_successful_job(
             record.status == JobStatus::Succeeded
                 && record.result.is_some()
                 && record.url == url
-                && record_url_sha256(record) == url_sha256
+                && record_url_sha256_matches(record, &url_sha256)
                 && record.format == *format
                 && record.cookie_profile == *cookie_profile
         })
-        .cloned()
-        .collect::<Vec<_>>();
-    matches.sort_by_key(|record| record.updated_at);
-    matches.pop().map(|record| QueueResponse {
-        id: record.id,
-        status: record.status,
-        status_url: format!("/v1/jobs/{}", record.id),
-        existing: true,
-    })
+        .max_by_key(|record| (record.updated_at, record.id))
+        .map(|record| QueueResponse {
+            id: record.id,
+            status: record.status.clone(),
+            status_url: format!("/v1/jobs/{}", record.id),
+            existing: true,
+        })
 }
 
-fn record_url_sha256(record: &JobRecord) -> String {
-    record
-        .url_sha256
-        .clone()
-        .unwrap_or_else(|| download_url_sha256(&record.url))
+fn record_url_sha256_matches(record: &JobRecord, expected: &str) -> bool {
+    match record.url_sha256.as_deref() {
+        Some(actual) => actual == expected,
+        None => download_url_sha256(&record.url) == expected,
+    }
 }
 
 fn download_url_sha256(url: &str) -> String {
-    Sha256::digest(url.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    sha256_hex(url.as_bytes())
 }
 
 impl From<EnqueueError> for ApiError {
@@ -3311,11 +3306,7 @@ async fn archive_sha256(entries: &[TarFileEntry<'_>]) -> Result<String, ApiError
     }
 
     hasher.update([0_u8; 1024]);
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>())
+    Ok(hex_lower(&hasher.finalize()))
 }
 
 async fn archive_etag(entries: &[TarFileEntry<'_>]) -> Result<String, ApiError> {

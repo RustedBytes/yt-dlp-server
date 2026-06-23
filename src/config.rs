@@ -528,13 +528,7 @@ fn bool_setting(key: &str, file_value: Option<bool>, default: bool) -> anyhow::R
 fn string_list_setting(key: &str, file_value: Option<Vec<String>>) -> Vec<String> {
     env::var(key)
         .ok()
-        .map(|value| {
-            value
-                .split(',')
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .collect::<Vec<_>>()
-        })
+        .map(|value| split_string_list(&value))
         .or(file_value)
         .unwrap_or_default()
 }

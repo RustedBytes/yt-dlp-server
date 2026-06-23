@@ -6,7 +6,6 @@ use reqwest::{
     Url,
     header::{HOST, HeaderMap, HeaderName, HeaderValue},
 };
-use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use tokio::fs;
 use uuid::Uuid;
@@ -14,7 +13,7 @@ use uuid::Uuid;
 use crate::{
     config::{Config, ObjectStorageBackend, ObjectStorageConfig},
     types::{DownloadMetadata, StoredArtifacts, StoredObject},
-    util::{hmac_sha256_bytes, sha256_file_hex},
+    util::{hex_lower, hmac_sha256_bytes, sha256_file_hex, sha256_hex},
 };
 
 pub async fn store_download_artifacts(
@@ -126,11 +125,11 @@ fn signed_put_request(
         .format(&time::macros::format_description!(
             "[year][month][day]T[hour][minute][second]Z"
         ))
-        .unwrap();
+        .context("failed to format x-amz-date")?;
     let date = now
         .format(&time::macros::format_description!("[year][month][day]"))
-        .unwrap();
-    let payload_hash = hex_sha256(body);
+        .context("failed to format SigV4 date scope")?;
+    let payload_hash = sha256_hex(body);
     let host = url
         .host_str()
         .ok_or_else(|| anyhow!("object storage endpoint URL must include a host"))?;
@@ -158,7 +157,7 @@ fn signed_put_request(
     let scope = format!("{date}/{}/s3/aws4_request", config.region);
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
-        hex_sha256(canonical_request.as_bytes())
+        sha256_hex(canonical_request.as_bytes())
     );
     let access_key = config
         .access_key_id
@@ -168,8 +167,8 @@ fn signed_put_request(
         .secret_access_key
         .as_deref()
         .ok_or_else(|| anyhow!("object storage secret key is not configured"))?;
-    let signature = signing_key(secret_key, &date, &config.region)
-        .pipe(|key| hex_hmac(&key, string_to_sign.as_bytes()));
+    let signing_key = signing_key(secret_key, &date, &config.region);
+    let signature = hex_hmac(&signing_key, string_to_sign.as_bytes());
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
     );
@@ -265,33 +264,12 @@ fn signing_key(secret_key: &str, date: &str, region: &str) -> Vec<u8> {
 }
 
 fn hex_hmac(key: &[u8], bytes: &[u8]) -> String {
-    hmac_sha256_bytes(key, bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn hex_sha256(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex_lower(&hmac_sha256_bytes(key, bytes))
 }
 
 fn header_value(value: &str) -> anyhow::Result<HeaderValue> {
     HeaderValue::from_str(value).context("failed to build object storage request header")
 }
-
-trait Pipe: Sized {
-    fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
-        f(self)
-    }
-}
-
-impl<T> Pipe for T {}
 
 #[cfg(test)]
 mod tests {

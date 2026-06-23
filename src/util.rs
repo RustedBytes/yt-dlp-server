@@ -43,10 +43,7 @@ pub async fn append_jsonl(path: &Path, value: &impl Serialize) -> anyhow::Result
 }
 
 pub fn hmac_sha256_hex(secret: &str, bytes: &[u8]) -> String {
-    hmac_sha256_bytes(secret.as_bytes(), bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex_lower(&hmac_sha256_bytes(secret.as_bytes(), bytes))
 }
 
 pub fn hmac_sha256_bytes(key: &[u8], bytes: &[u8]) -> Vec<u8> {
@@ -66,11 +63,23 @@ pub async fn sha256_file_hex(path: &Path) -> std::io::Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    Ok(hex_lower(&hasher.finalize()))
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex_lower(&hasher.finalize())
+}
+
+pub fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 #[cfg(test)]
@@ -87,6 +96,11 @@ mod tests {
             signature,
             "b82fcb791acec57859b989b430a826488ce2e479fdf92326bd0a2e8375a42ba4"
         );
+    }
+
+    #[test]
+    fn encodes_bytes_as_lowercase_hex() {
+        assert_eq!(hex_lower(&[0x00, 0x0f, 0x10, 0xab, 0xff]), "000f10abff");
     }
 
     #[tokio::test]

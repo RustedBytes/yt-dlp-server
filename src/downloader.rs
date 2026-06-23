@@ -195,13 +195,17 @@ fn download_error(
 }
 
 async fn prepare_download_dir(job_dir: &Path) -> anyhow::Result<()> {
-    if job_dir.exists() {
-        fs::remove_dir_all(job_dir).await.with_context(|| {
-            format!(
-                "failed to clear existing download dir {}",
-                job_dir.display()
-            )
-        })?;
+    match fs::remove_dir_all(job_dir).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to clear existing download dir {}",
+                    job_dir.display()
+                )
+            });
+        }
     }
     fs::create_dir_all(job_dir)
         .await
@@ -507,14 +511,22 @@ where
 {
     tokio::spawn(async move {
         let mut bytes = Vec::new();
-        let _ = pipe.read_to_end(&mut bytes).await;
+        if let Err(err) = pipe.read_to_end(&mut bytes).await {
+            warn!("failed to read process output pipe error={}", err);
+        }
         bytes
     })
 }
 
 async fn drain_pipe(handle: Option<JoinHandle<Vec<u8>>>) -> Vec<u8> {
     match handle {
-        Some(handle) => handle.await.unwrap_or_default(),
+        Some(handle) => match handle.await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!("process output reader task failed error={}", err);
+                Vec::new()
+            }
+        },
         None => Vec::new(),
     }
 }
