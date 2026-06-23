@@ -777,6 +777,13 @@ fn is_supported_social_host(host: &str) -> bool {
         "facebook.com",
         "fb.watch",
         "snapchat.com",
+        "rutube.ru",
+        "douyin.com",
+        "likee.video",
+        "vk.com",
+        "vkvideo.ru",
+        "yappy.media",
+        "xiaohongshu.com",
         "x.com",
         "twitter.com",
     ];
@@ -1149,14 +1156,21 @@ mod tests {
                 "https://www.facebook.com/reel/123".to_string(),
                 "https://fb.watch/abc/".to_string(),
                 "https://www.snapchat.com/spotlight/abc".to_string(),
+                "https://rutube.ru/shorts/abc/".to_string(),
+                "https://www.douyin.com/video/6961737553342991651".to_string(),
+                "https://www.likee.video/@user/video/123".to_string(),
+                "https://vk.com/clip-123_456".to_string(),
+                "https://vkvideo.ru/video-123_456".to_string(),
+                "https://yappy.media/video/abc".to_string(),
+                "https://www.xiaohongshu.com/explore/abc123".to_string(),
                 "https://x.com/user/status/123".to_string(),
                 "https://twitter.com/user/status/123".to_string(),
             ],
-            10,
+            20,
         )
         .unwrap();
 
-        assert_eq!(urls.len(), 9);
+        assert_eq!(urls.len(), 16);
         assert_eq!(urls[0], "https://www.tiktok.com/@user/video/123");
         assert_eq!(urls[1], "https://www.instagram.com/reel/abc/");
         assert_eq!(urls[2], "https://www.youtube.com/shorts/abc");
@@ -1164,8 +1178,15 @@ mod tests {
         assert_eq!(urls[4], "https://www.facebook.com/reel/123");
         assert_eq!(urls[5], "https://fb.watch/abc/");
         assert_eq!(urls[6], "https://www.snapchat.com/spotlight/abc");
-        assert_eq!(urls[7], "https://x.com/user/status/123");
-        assert_eq!(urls[8], "https://twitter.com/user/status/123");
+        assert_eq!(urls[7], "https://rutube.ru/shorts/abc/");
+        assert_eq!(urls[8], "https://www.douyin.com/video/6961737553342991651");
+        assert_eq!(urls[9], "https://www.likee.video/@user/video/123");
+        assert_eq!(urls[10], "https://vk.com/clip-123_456");
+        assert_eq!(urls[11], "https://vkvideo.ru/video-123_456");
+        assert_eq!(urls[12], "https://yappy.media/video/abc");
+        assert_eq!(urls[13], "https://www.xiaohongshu.com/explore/abc123");
+        assert_eq!(urls[14], "https://x.com/user/status/123");
+        assert_eq!(urls[15], "https://twitter.com/user/status/123");
     }
 
     #[test]

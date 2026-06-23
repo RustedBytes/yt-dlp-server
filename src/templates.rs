@@ -157,7 +157,7 @@ use crate::types::{JobRecord, QueueResponse};
     <form method="post" action="/downloads-form">
       <div>
         <label for="urls">URLs</label>
-        <textarea id="urls" name="urls" placeholder="https://www.tiktok.com/@user/video/123&#10;https://www.instagram.com/reel/ABC/&#10;https://www.youtube.com/shorts/XYZ" required></textarea>
+        <textarea id="urls" name="urls" placeholder="https://www.tiktok.com/@user/video/123&#10;https://www.instagram.com/reel/ABC/&#10;https://rutube.ru/shorts/XYZ/" required></textarea>
       </div>
 
       <div>

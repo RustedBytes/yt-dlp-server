@@ -18,4 +18,12 @@ Supported hosts are:
 - YouTube Shorts: `youtube.com`, `youtu.be`, and subdomains such as `www.youtube.com` and `m.youtube.com`
 - Facebook Reels/watch links: `facebook.com`, `fb.watch`, and subdomains such as `www.facebook.com`
 - Snapchat Spotlight: `snapchat.com` and subdomains such as `www.snapchat.com`
+- RUTUBE Shorts: `rutube.ru` and subdomains
+- Douyin short videos: `douyin.com` and subdomains such as `www.douyin.com`
+- Likee short videos: `likee.video` and subdomains such as `www.likee.video`
+- VK Clips: `vk.com`, `vkvideo.ru`, and subdomains such as `m.vk.com`
+- Yappy vertical videos: `yappy.media` and subdomains
+- XiaoHongShu / RedNote short-video posts: `xiaohongshu.com` and subdomains
 - X/Twitter video links: `x.com`, `twitter.com`, and subdomains such as `mobile.twitter.com`
+
+The allowlist is intentionally host-based. A supported host means the request may be queued; the actual download still depends on the current `yt-dlp` extractor behavior for that specific URL.
